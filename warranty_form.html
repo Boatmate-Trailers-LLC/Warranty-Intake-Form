@@ -1,0 +1,255 @@
+<!doctype html>
+<!--
+  Warranty Intake (Proof of Concept) — Fully Commented
+
+  WHAT THIS DOES
+  --------------
+  • Renders a small, accessible form to capture VIN and Email.
+  • Category is fixed to "Warranty" and is INCLUDED in submission but NOT SHOWN to the user.
+  • If JavaScript is available, the form submits via fetch() as JSON to /api/warranty-intake.
+  • If JavaScript is disabled or fails, the browser performs a normal HTML POST to /api/warranty-intake.
+  • Displays inline success/error messages for a better UX.
+  • Includes a simple "honeypot" trap to deter basic bots.
+
+  BACKEND EXPECTATION
+  -------------------
+  • Endpoint: POST /api/warranty-intake
+  • Accepts JSON: { vin: string, email: string, category: "Warranty" }
+  • Responds with JSON: { ok: boolean, message?: string }, using HTTP 2xx for success and 4xx/5xx for failure.
+
+  SECURITY/PRIVACY NOTES
+  ----------------------
+  • Do not embed secrets in client-side code.
+  • Validate and sanitize on the server (VIN, email).
+  • Add rate limiting and CSRF/origin checks on the backend if needed.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Warranty Intake</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    /* 
+      BASIC, READABLE STYLES
+      - Minimal styling so this can drop into any static host quickly.
+      - Uses system fonts; no external dependencies.
+    */
+    :root { --gap: 0.75rem; }
+    body { font: 16px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 2rem; }
+    form { max-width: 520px; display: grid; gap: var(--gap); }
+    label { font-weight: 600; }
+    input, button { padding: 0.625rem 0.75rem; border: 1px solid #ccc; border-radius: 8px; }
+    .hint { font-size: 0.875rem; color: #666; }
+    .error { color: #b00020; font-size: 0.95rem; }
+    .success { color: #0a7d2b; font-size: 0.95rem; }
+    .visually-hidden { 
+      /* 
+        For the "honeypot" anti-bot field and any elements we want hidden from users
+        while still existing in the DOM. Screen readers also skip due to aria-hidden.
+      */
+      position: absolute; 
+      left: -9999px; 
+      width: 1px; 
+      height: 1px; 
+      overflow: hidden;
+    }
+    button { cursor: pointer; }
+  </style>
+</head>
+<body>
+
+  <!-- Page heading for context; change as desired -->
+  <h1>Warranty Intake</h1>
+
+  <!-- 
+    The form:
+    - action points to the backend endpoint you’ll implement.
+    - method="post" allows non-JS fallback to work naturally.
+    - novalidate defers validation to our JS (we still call input.checkValidity()).
+  -->
+  <form id="warranty-intake-form" method="post" action="https://boatmate-warranty-intake.mike-c00.workers.dev/" novalidate>
+
+    <!-- 
+      CATEGORY (HIDDEN)
+      - Required by backend but should not be shown to users.
+      - Kept as a hidden input so that in non-JS fallback, the server still receives it.
+      - The JS will also send it in the JSON payload to keep behavior consistent.
+    -->
+    <input type="hidden" id="category" name="category" value="Warranty" />
+
+    <!-- VIN field -->
+    <div>
+      <label for="vin">VIN</label>
+      <input
+        id="vin"
+        name="vin"
+        type="text"
+        inputmode="latin"
+        autocomplete="on"
+        spellcheck="false"
+        maxlength="17"          
+        pattern="[A-HJ-NPR-Z0-9]{17}"
+        required
+        aria-describedby="vin-hint"
+      />
+      <div id="vin-hint" class="hint">
+        Enter the trailer VIN (17 characters; letters I, O, and Q are not used).
+      </div>
+    </div>
+
+    <!-- Email field -->
+    <div>
+      <label for="email">Email</label>
+      <input
+        id="email"
+        name="email"
+        type="email" 
+        autocomplete="email"
+        required
+      />
+    </div>
+
+    <!-- 
+      Live status region:
+      - role="status" + aria-live allow screen readers to announce updates.
+      - We toggle .success/.error classes for color only; message text is key.
+    -->
+    <div id="form-status" role="status" aria-live="polite"></div>
+
+    <!-- Submit button -->
+    <button type="submit">Submit</button>
+
+    <!-- 
+      Honeypot anti-bot field:
+      - Legitimate users never see this; bots often fill all inputs and get detected.
+      - If filled, we pretend success to avoid tipping off spammers (optional pattern).
+    -->
+    <div class="visually-hidden" aria-hidden="true">
+      <label for="website">Leave this field empty</label>
+      <input id="website" name="website" type="text" tabindex="-1" autocomplete="off" />
+    </div>
+  </form>
+
+  <script>
+    (function () {
+      // Grab references to key elements once at startup.
+      const form = document.getElementById('warranty-intake-form');
+      const statusEl = document.getElementById('form-status');
+      const vinInput = document.getElementById('vin');
+      const emailInput = document.getElementById('email');
+      const categoryInput = document.getElementById('category'); // hidden, value="Warranty"
+      const honeypot = document.getElementById('website');
+
+      /**
+       * setStatus(message, ok)
+       * ---------------------
+       * Updates the status region with a message and visual state.
+       * @param {string} message - Text to show the user.
+       * @param {boolean} ok - When true, styles as success; otherwise error.
+       */
+      function setStatus(message, ok = true) {
+        statusEl.textContent = message;
+        statusEl.className = ok ? 'success' : 'error';
+      }
+
+      /**
+       * validateVIN(vin)
+       * ----------------
+       * Enforces a simple VIN format rule set for trailers:
+       *  - 17 alphanumeric characters
+       *  - Excludes I, O, Q (to avoid confusion with 1 and 0)
+       * Note: This is NOT a checksum validation; keep server-side validation authoritative.
+       */
+      function validateVIN(vin) {
+        // Normalize: uppercase and remove internal spaces.
+        const v = vin.toUpperCase().replace(/\s+/g, '');
+        // Pattern aligns with the input@pattern attribute for consistency.
+        const re = /^[A-HJ-NPR-Z0-9]{17}$/;
+        return re.test(v);
+      }
+
+      /**
+       * submitHandler(event)
+       * --------------------
+       * Intercepts the browser's default form submission to perform a fetch()-based
+       * JSON POST. If fetch() is unavailable for any reason, it allows the normal
+       * HTML form POST to continue (progressive enhancement).
+       */
+      async function submitHandler(e) {
+        // If the environment has no fetch (very old browsers), allow standard POST.
+        if (!window.fetch) return;
+
+        // Use AJAX path: stop the default form submission.
+        e.preventDefault();
+
+        // Clear previous status styles.
+        statusEl.textContent = '';
+        statusEl.className = '';
+
+        // BOT TRAP: If the honeypot has text, treat as spam and fake success.
+        if (honeypot && honeypot.value) {
+          setStatus('Thanks! Your request has been received.', true);
+          form.reset();
+          // Re-assert category value after reset (hidden input gets cleared by reset()).
+          if (categoryInput) categoryInput.value = 'Warranty';
+          return;
+        }
+
+        // Gather and normalize inputs.
+        const vinRaw = vinInput.value.trim();
+        const vin = vinRaw.toUpperCase().replace(/\s+/g, '');
+        const email = emailInput.value.trim();
+
+        // Client-side validation for quick feedback (server must still validate).
+        if (!validateVIN(vin)) {
+          setStatus('Please enter a valid VIN (17 characters; letters I, O, Q are not used).', false);
+          vinInput.focus();
+          return;
+        }
+        if (!emailInput.checkValidity()) {
+          setStatus('Please enter a valid email address.', false);
+          emailInput.focus();
+          return;
+        }
+
+        // Category comes from the hidden input; default to "Warranty" if missing.
+        const category = (categoryInput && categoryInput.value) ? categoryInput.value : 'Warranty';
+
+        // Build the JSON payload expected by the backend.
+        const payload = { vin, email, category };
+
+        try {
+          // Send JSON to the backend endpoint defined in form.action.
+          const res = await fetch(form.action, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            // NOTE: Add credentials/headers if your backend requires auth or CSRF tokens.
+          });
+
+          // Attempt to parse JSON response; if parsing fails, fall back to empty object.
+          const data = await res.json().catch(() => ({}));
+
+          // Success path: HTTP 2xx with data.ok !== false (treat missing ok as true).
+          if (res.ok && data.ok !== false) {
+            setStatus(data.message || 'Submitted. Check your email for confirmation.');
+            form.reset();
+            // Restore hidden Category value post-reset for subsequent submissions.
+            if (categoryInput) categoryInput.value = 'Warranty';
+          } else {
+            // Failure path: non-2xx or explicit ok:false in payload.
+            const msg = data.message || `Submission failed (${res.status}). Please try again.`;
+            setStatus(msg, false);
+          }
+        } catch (err) {
+          // Network-level failure: offline, CORS, DNS, etc.
+          setStatus('Network error. Please try again in a moment.', false);
+        }
+      }
+
+      // Attach the submit handler once the script runs.
+      form.addEventListener('submit', submitHandler);
+    })();
+  </script>
+</body>
+</html>
