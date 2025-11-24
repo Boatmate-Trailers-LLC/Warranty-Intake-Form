@@ -17,6 +17,9 @@ compatibility_date = "2024-11-01"
 # Set to false if you only want custom domain routes.
 workers_dev = true
 
+# Cloudflare account ID:
+account_id = "808eaf14ab4188158744569e38766ce2"
+
 # Optional: silence Wrangler's "Preview URLs" warning.
 #   - true  → always enable preview URLs
 #   - false → always disable preview URLs
