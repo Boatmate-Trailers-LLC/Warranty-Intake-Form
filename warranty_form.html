@@ -1,3 +1,47 @@
+<!--
+  Boatmate Warranty Intake Form
+  =============================
+
+  PURPOSE
+  - Collects dealer/customer and warranty claim details for Boatmate trailers.
+  - Posts via multipart/form-data to the Cloudflare Worker warranty endpoint.
+  - Supports image/document uploads: .jpg, .jpeg, .png, .heic, .pdf, .docx, .xlsx.
+
+  LAYOUT / UX
+  - Mobile-first, responsive CSS grid:
+      • All fields stack in a single column on small screens.
+      • Dealer/Customer sections use an auto-fit grid on wider screens.
+      • Top row of warranty info is a strict 3-column layout (VIN / Date / Ship To).
+      • Remaining warranty fields are a 2-column layout with “File Upload” spanning both.
+  - `box-sizing: border-box` globally to avoid horizontal scrolling issues.
+  - Form is centered using a `.wrapper` with max-width and side padding.
+
+  CONDITIONAL LOGIC (handled client-side in JS)
+  - “Who is submitting this claim?” (radio):
+      • If Dealer:
+          - All Dealer fields are required.
+          - All Customer fields are optional.
+          - “Original owner?” fieldset is hidden and cleared.
+      • If Trailer Owner:
+          - All Customer fields are required.
+          - All Dealer fields are optional.
+          - “Original owner?” fieldset is shown and required.
+  - VIN is normalized to uppercase and validated against 17-char VIN pattern (no I/O/Q).
+  - Honeypot (`website` field) silently accepts bots without creating a real submission.
+
+  INTEGRATION EXPECTATIONS
+  - Backend Cloudflare Worker:
+      • Validates VIN and email.
+      • Issues sequential Claim # via Durable Object.
+      • Upserts HubSpot Contact and creates a Ticket in Warranty pipeline.
+      • Uploads attachments to HubSpot Files and associates them via Note.
+      • Optionally sends confirmation email (Brevo), using “who is submitting” to
+        determine which email address to treat as primary.
+
+  NOTE
+  - Keep IDs and `name` attributes in sync with the Worker and HubSpot property mappings
+    before changing any form field names.
+-->
 <!doctype html>
 <html lang="en">
 <head>
@@ -9,7 +53,6 @@
     *, *::before, *::after {
         box-sizing: border-box;
     }
-
 
     :root { --gap: 0.75rem; } 
 
@@ -47,7 +90,6 @@
 
     .wrapper {
         max-width: 800px;
-        /* max-width: 768px; */
         margin: 0 auto;
         padding: 0 1rem;
     }
@@ -102,10 +144,6 @@
 
     /* Tighter padding on small screens so the form doesn't feel squished */
     @media (max-width: 600px) {
-        body {
-            /* padding: 1rem; */
-        }
-
         form {
             max-width: none;      /* let it fill the viewport width */
             border-radius: 0.75rem;
@@ -199,383 +237,413 @@
   </style>
 </head>
 <body>
-    <div class="wrapper">
-  <h1>Warranty Intake</h1>
+  <div class="wrapper">
+    <h1>Warranty Intake</h1>
 
-  <!--
-    PRODUCTION FORM
-    ---------------
-    • 3 sections: Dealer, Customer, Warranty Claim.
-    • Posts to Cloudflare Worker endpoint.
-    • enctype="multipart/form-data" so file upload works with and without JS.
-  -->
-  <form
-    id="warranty-intake-form"
-    method="post"
-    action="https://warranty-intake-form.boatmate-trailers-llc.workers.dev/"
-    enctype="multipart/form-data"
-    novalidate
-  >
-    <!-- Hidden Category (always "Warranty") -->
-    <input type="hidden" id="category" name="category" value="Warranty" />
+    <!--
+      PRODUCTION FORM
+      ---------------
+      • 3 sections: Dealer, Customer, Warranty Claim.
+      • Posts to Cloudflare Worker endpoint.
+      • enctype="multipart/form-data" so file upload works with and without JS.
+    -->
+    <form
+      id="warranty-intake-form"
+      method="post"
+      action="https://warranty-intake-form.boatmate-trailers-llc.workers.dev/"
+      enctype="multipart/form-data"
+      novalidate
+    >
+      <!-- Hidden Category (always "Warranty") -->
+      <input type="hidden" id="category" name="category" value="Warranty" />
 
-    <!-- Who is submitting this claim? -->
-    <fieldset>
-      <legend>Who is submitting this claim?</legend>
-      <div class="radio-group">
-        <label class="radio-option" for="claim_submitted_by_dealer">
-          <input
-            type="radio"
-            id="claim_submitted_by_dealer"
-            name="claim_submitted_by"
-            value="dealer"
-            required
-          />
-          Dealer
-        </label>
+      <!-- Who is submitting this claim? -->
+      <fieldset>
+        <legend>Who is submitting this claim?</legend>
+        <div class="radio-group">
+          <label class="radio-option" for="claim_submitted_by_dealer">
+            <input
+              type="radio"
+              id="claim_submitted_by_dealer"
+              name="claim_submitted_by"
+              value="dealer"
+              required
+            />
+            Dealer
+          </label>
 
-        <label class="radio-option" for="claim_submitted_by_customer">
-          <input
-            type="radio"
-            id="claim_submitted_by_customer"
-            name="claim_submitted_by"
-            value="customer"
-          />
-          Trailer Owner
-        </label>
+          <label class="radio-option" for="claim_submitted_by_customer">
+            <input
+              type="radio"
+              id="claim_submitted_by_customer"
+              name="claim_submitted_by"
+              value="customer"
+            />
+            Trailer Owner
+          </label>
+        </div>
+      </fieldset>
+
+      <!-- 1) Dealer Information -->
+      <fieldset>
+        <legend>Dealer Information</legend>
+        <div class="field-grid">
+          <div class="field field-wide">
+            <label for="dealer_name">Dealership</label>
+            <input
+              id="dealer_name"
+              name="dealer_name"
+              type="text"
+              autocomplete="organization"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="dealer_first_name">First Name</label>
+            <input
+              id="dealer_first_name"
+              name="dealer_first_name"
+              type="text"
+              autocomplete="given-name"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="dealer_last_name">Last Name</label>
+            <input
+              id="dealer_last_name"
+              name="dealer_last_name"
+              type="text"
+              autocomplete="family-name"
+              required
+            />
+          </div>
+
+          <div class="field field-wide">
+            <label for="dealer_address">Address</label>
+            <input
+              id="dealer_address"
+              name="dealer_address"
+              type="text"
+              autocomplete="address-line1"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="dealer_city">City</label>
+            <input
+              id="dealer_city"
+              name="dealer_city"
+              type="text"
+              autocomplete="address-level2"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="dealer_region">State/Province/Region</label>
+            <input
+              id="dealer_region"
+              name="dealer_region"
+              type="text"
+              autocomplete="address-level1"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="dealer_postal_code">Zip/Postal Code</label>
+            <input
+              id="dealer_postal_code"
+              name="dealer_postal_code"
+              type="text"
+              autocomplete="postal-code"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="dealer_country">Country/Region</label>
+            <input
+              id="dealer_country"
+              name="dealer_country"
+              type="text"
+              autocomplete="country"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="dealer_phone">Phone</label>
+            <input
+              id="dealer_phone"
+              name="dealer_phone"
+              type="tel"
+              autocomplete="tel"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="dealer_email">Email</label>
+            <input
+              id="dealer_email"
+              name="dealer_email"
+              type="email"
+              autocomplete="email"
+              required
+            />
+          </div>
+        </div>
+      </fieldset>
+
+      <!-- 2) Customer Information -->
+      <fieldset>
+        <legend>Customer Information</legend>
+        <div class="field-grid">
+          <div class="field">
+            <label for="customer_first_name">First Name</label>
+            <input
+              id="customer_first_name"
+              name="customer_first_name"
+              type="text"
+              autocomplete="given-name"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="customer_last_name">Last Name</label>
+            <input
+              id="customer_last_name"
+              name="customer_last_name"
+              type="text"
+              autocomplete="family-name"
+              required
+            />
+          </div>
+
+          <div class="field field-wide">
+            <label for="customer_address">Address</label>
+            <input
+              id="customer_address"
+              name="customer_address"
+              type="text"
+              autocomplete="address-line1"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="customer_city">City</label>
+            <input
+              id="customer_city"
+              name="customer_city"
+              type="text"
+              autocomplete="address-level2"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="customer_region">State/Province/Region</label>
+            <input
+              id="customer_region"
+              name="customer_region"
+              type="text"
+              autocomplete="address-level1"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="customer_postal_code">Zip/Postal Code</label>
+            <input
+              id="customer_postal_code"
+              name="customer_postal_code"
+              type="text"
+              autocomplete="postal-code"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="customer_country">Country/Region</label>
+            <input
+              id="customer_country"
+              name="customer_country"
+              type="text"
+              autocomplete="country"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="customer_phone">Phone</label>
+            <input
+              id="customer_phone"
+              name="customer_phone"
+              type="tel"
+              autocomplete="tel"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="customer_email">Email</label>
+            <input
+              id="customer_email"
+              name="customer_email"
+              type="email"
+              autocomplete="email"
+              required
+            />
+          </div>
+        </div>
+      </fieldset>
+
+      <!-- Original Owner? (conditional) -->
+      <fieldset id="original-owner-fieldset" style="display:none;">
+        <legend>Are you the original owner of this trailer?</legend>
+        <div class="radio-group">
+          <label class="radio-option" for="original_owner_yes">
+            <input
+              type="radio"
+              id="original_owner_yes"
+              name="original_owner"
+              value="yes"
+            />
+            Yes
+          </label>
+
+          <label class="radio-option" for="original_owner_no">
+            <input
+              type="radio"
+              id="original_owner_no"
+              name="original_owner"
+              value="no"
+            />
+            No
+          </label>
+        </div>
+      </fieldset>
+
+      <!-- 3) Warranty Claim Information -->
+      <fieldset>
+        <legend>Warranty Claim Information</legend>
+
+        <!-- Top row: 3 columns -->
+        <div class="field-grid field-grid--three">
+          <div class="field">
+            <label for="vin">Trailer VIN</label>
+            <input
+              id="vin"
+              name="vin"
+              type="text"
+              inputmode="latin"
+              autocomplete="on"
+              spellcheck="false"
+              maxlength="17"
+              pattern="[A-HJ-NPR-Z0-9]{17}"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="date_of_occurrence">Date of Occurrence</label>
+            <input
+              id="date_of_occurrence"
+              name="date_of_occurrence"
+              type="date"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="ship_to">Ship To</label>
+            <select id="ship_to" name="ship_to" required>
+              <option value="">Select an option</option>
+              <option value="Dealer">Dealer</option>
+              <option value="Customer">Customer</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Remaining fields: 2-column grid -->
+        <div class="field-grid field-grid--two">
+          <div class="field">
+            <label for="warranty_symptoms">Warranty Symptoms</label>
+            <textarea
+              id="warranty_symptoms"
+              name="warranty_symptoms"
+              required
+            ></textarea>
+          </div>
+
+          <div class="field">
+            <label for="warranty_request">Warranty Request</label>
+            <textarea
+              id="warranty_request"
+              name="warranty_request"
+              required
+            ></textarea>
+          </div>
+
+          <div class="field">
+            <label for="labor_rate">Warranty Labor Rate</label>
+            <input
+              id="labor_rate"
+              name="labor_rate"
+              type="number"
+              step="0.01"
+              min="0"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="labor_hours">Warranty Labor Hours</label>
+            <input
+              id="labor_hours"
+              name="labor_hours"
+              type="number"
+              step="0.1"
+              min="0"
+              required
+            />
+          </div>
+
+          <div class="field field-wide">
+            <label for="attachments">File Upload</label>
+            <input
+              id="attachments"
+              name="attachments"
+              type="file"
+              multiple
+              required
+              accept=".jpg,.jpeg,.png,.heic,.pdf,.docx,.xlsx"
+            />
+          </div>
+        </div>
+      </fieldset>
+
+      <!-- Live status region -->
+      <div id="form-status" role="status" aria-live="polite"></div>
+
+      <!-- Submit button -->
+      <button type="submit">Submit Warranty Claim</button>
+
+      <!-- Honeypot anti-bot field -->
+      <div class="visually-hidden" aria-hidden="true">
+        <label for="website">Leave this field empty</label>
+        <input id="website" name="website" type="text" tabindex="-1" autocomplete="off" />
       </div>
-    </fieldset>
-
-    <!-- 1) Dealer Information -->
-    <fieldset>
-      <legend>Dealer Information</legend>
-      <div class="field-grid">
-        <div class="field field-wide">
-          <label for="dealer_name">Dealership</label>
-          <input
-            id="dealer_name"
-            name="dealer_name"
-            type="text"
-            autocomplete="organization"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="dealer_first_name">First Name</label>
-          <input
-            id="dealer_first_name"
-            name="dealer_first_name"
-            type="text"
-            autocomplete="given-name"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="dealer_last_name">Last Name</label>
-          <input
-            id="dealer_last_name"
-            name="dealer_last_name"
-            type="text"
-            autocomplete="family-name"
-            required
-          />
-        </div>
-
-        <div class="field field-wide">
-          <label for="dealer_address">Address</label>
-          <input
-            id="dealer_address"
-            name="dealer_address"
-            type="text"
-            autocomplete="address-line1"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="dealer_city">City</label>
-          <input
-            id="dealer_city"
-            name="dealer_city"
-            type="text"
-            autocomplete="address-level2"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="dealer_region">State/Province/Region</label>
-          <input
-            id="dealer_region"
-            name="dealer_region"
-            type="text"
-            autocomplete="address-level1"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="dealer_postal_code">Zip/Postal Code</label>
-          <input
-            id="dealer_postal_code"
-            name="dealer_postal_code"
-            type="text"
-            autocomplete="postal-code"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="dealer_country">Country/Region</label>
-          <input
-            id="dealer_country"
-            name="dealer_country"
-            type="text"
-            autocomplete="country"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="dealer_phone">Phone</label>
-          <input
-            id="dealer_phone"
-            name="dealer_phone"
-            type="tel"
-            autocomplete="tel"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="dealer_email">Email</label>
-          <input
-            id="dealer_email"
-            name="dealer_email"
-            type="email"
-            autocomplete="email"
-            required
-          />
-        </div>
-      </div>
-    </fieldset>
-
-    <!-- 2) Customer Information -->
-    <fieldset>
-      <legend>Customer Information</legend>
-      <div class="field-grid">
-        <div class="field">
-          <label for="customer_first_name">First Name</label>
-          <input
-            id="customer_first_name"
-            name="customer_first_name"
-            type="text"
-            autocomplete="given-name"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="customer_last_name">Last Name</label>
-          <input
-            id="customer_last_name"
-            name="customer_last_name"
-            type="text"
-            autocomplete="family-name"
-            required
-          />
-        </div>
-
-        <div class="field field-wide">
-          <label for="customer_address">Address</label>
-          <input
-            id="customer_address"
-            name="customer_address"
-            type="text"
-            autocomplete="address-line1"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="customer_city">City</label>
-          <input
-            id="customer_city"
-            name="customer_city"
-            type="text"
-            autocomplete="address-level2"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="customer_region">State/Province/Region</label>
-          <input
-            id="customer_region"
-            name="customer_region"
-            type="text"
-            autocomplete="address-level1"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="customer_postal_code">Zip/Postal Code</label>
-          <input
-            id="customer_postal_code"
-            name="customer_postal_code"
-            type="text"
-            autocomplete="postal-code"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="customer_country">Country/Region</label>
-          <input
-            id="customer_country"
-            name="customer_country"
-            type="text"
-            autocomplete="country"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="customer_phone">Phone</label>
-          <input
-            id="customer_phone"
-            name="customer_phone"
-            type="tel"
-            autocomplete="tel"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="customer_email">Email</label>
-          <input
-            id="customer_email"
-            name="customer_email"
-            type="email"
-            autocomplete="email"
-            required
-          />
-        </div>
-      </div>
-    </fieldset>
-
-        <!-- 3) Warranty Claim Information -->
-    <fieldset>
-      <legend>Warranty Claim Information</legend>
-
-      <!-- Top row: 3 columns -->
-      <div class="field-grid field-grid--three">
-        <div class="field">
-          <label for="vin">Trailer VIN</label>
-          <input
-            id="vin"
-            name="vin"
-            type="text"
-            inputmode="latin"
-            autocomplete="on"
-            spellcheck="false"
-            maxlength="17"
-            pattern="[A-HJ-NPR-Z0-9]{17}"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="date_of_occurrence">Date of Occurrence</label>
-          <input
-            id="date_of_occurrence"
-            name="date_of_occurrence"
-            type="date"
-            required
-          />
-        </div>
-
-        <div class="field">
-          <label for="ship_to">Ship To</label>
-          <select id="ship_to" name="ship_to" required>
-            <option value="">Select an option</option>
-            <option value="Dealer">Dealer</option>
-            <option value="Customer">Customer</option>
-          </select>
-        </div>
-      </div>
-
-      <!-- Remaining fields: 2-column grid -->
-      <div class="field-grid field-grid--two">
-        <div class="field">
-          <label for="warranty_symptoms">Warranty Symptoms</label>
-          <textarea
-            id="warranty_symptoms"
-            name="warranty_symptoms"
-            required
-          ></textarea>
-        </div>
-
-        <div class="field">
-          <label for="warranty_request">Warranty Request</label>
-          <textarea
-            id="warranty_request"
-            name="warranty_request"
-            required
-          ></textarea>
-        </div>
-
-        <div class="field">
-          <label for="labor_rate">Warranty Labor Rate</label>
-          <input
-            id="labor_rate"
-            name="labor_rate"
-            type="number"
-            step="0.01"
-            min="0"
-          />
-        </div>
-
-        <div class="field">
-          <label for="labor_hours">Warranty Labor Hours</label>
-          <input
-            id="labor_hours"
-            name="labor_hours"
-            type="number"
-            step="0.1"
-            min="0"
-          />
-        </div>
-
-        <div class="field field-wide">
-          <label for="attachments">File Upload</label>
-          <input
-            id="attachments"
-            name="attachments"
-            type="file"
-            multiple
-            accept="image/*,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.pdf,.doc,.docx,.xls,.xlsx"
-          />
-        </div>
-      </div>
-    </fieldset>
-
-    <!-- Live status region -->
-    <div id="form-status" role="status" aria-live="polite"></div>
-
-    <!-- Submit button -->
-    <button type="submit">Submit Warranty Claim</button>
-
-    <!-- Honeypot anti-bot field -->
-    <div class="visually-hidden" aria-hidden="true">
-      <label for="website">Leave this field empty</label>
-      <input id="website" name="website" type="text" tabindex="-1" autocomplete="off" />
-    </div>
-  </form>
+    </form>
   </div> <!-- Wrapper end -->
+
   <script>
     (function () {
       const form = document.getElementById('warranty-intake-form');
@@ -583,6 +651,39 @@
       const vinInput = document.getElementById('vin');
       const categoryInput = document.getElementById('category');
       const honeypot = document.getElementById('website');
+
+      const dealerFields = [
+        'dealer_name',
+        'dealer_first_name',
+        'dealer_last_name',
+        'dealer_address',
+        'dealer_city',
+        'dealer_region',
+        'dealer_postal_code',
+        'dealer_country',
+        'dealer_phone',
+        'dealer_email'
+      ].map(id => document.getElementById(id));
+
+      const customerFields = [
+        'customer_first_name',
+        'customer_last_name',
+        'customer_address',
+        'customer_city',
+        'customer_region',
+        'customer_postal_code',
+        'customer_country',
+        'customer_phone',
+        'customer_email'
+      ].map(id => document.getElementById(id));
+
+      const claimSubmittedByDealer = document.getElementById('claim_submitted_by_dealer');
+      const claimSubmittedByCustomer = document.getElementById('claim_submitted_by_customer');
+      const originalOwnerFieldset = document.getElementById('original-owner-fieldset');
+      const originalOwnerInputs = [
+        document.getElementById('original_owner_yes'),
+        document.getElementById('original_owner_no')
+      ];
 
       function setStatus(message, ok = true) {
         statusEl.textContent = message;
@@ -596,8 +697,61 @@
         return re.test(v);
       }
 
+      function setRequired(fields, required) {
+        fields.forEach(input => {
+          if (!input) return;
+          if (required) {
+            input.setAttribute('required', 'required');
+          } else {
+            input.removeAttribute('required');
+          }
+        });
+      }
+
+      function clearOriginalOwnerSelection() {
+        originalOwnerInputs.forEach(input => {
+          if (input) input.checked = false;
+        });
+        originalOwnerInputs.forEach(input => {
+          if (input) input.removeAttribute('required');
+        });
+      }
+
+      function syncClaimSubmittedByRequirements() {
+        const isDealer = claimSubmittedByDealer.checked;
+        const isCustomer = claimSubmittedByCustomer.checked;
+
+        if (isDealer) {
+          setRequired(dealerFields, true);
+          setRequired(customerFields, false);
+          originalOwnerFieldset.style.display = 'none';
+          clearOriginalOwnerSelection();
+        } else if (isCustomer) {
+          setRequired(dealerFields, false);
+          setRequired(customerFields, true);
+          originalOwnerFieldset.style.display = 'block';
+          originalOwnerInputs.forEach(input => {
+            if (input) input.setAttribute('required', 'required');
+          });
+        } else {
+          setRequired(dealerFields, false);
+          setRequired(customerFields, false);
+          originalOwnerFieldset.style.display = 'none';
+          clearOriginalOwnerSelection();
+        }
+      }
+
+      if (claimSubmittedByDealer) {
+        claimSubmittedByDealer.addEventListener('change', syncClaimSubmittedByRequirements);
+      }
+      if (claimSubmittedByCustomer) {
+        claimSubmittedByCustomer.addEventListener('change', syncClaimSubmittedByRequirements);
+      }
+
+      // Initialize on load
+      syncClaimSubmittedByRequirements();
+
       async function submitHandler(e) {
-        // If fetch isn't available, fall back to normal browser POST.
         if (!window.fetch) return;
 
         e.preventDefault();
@@ -605,21 +759,19 @@
         statusEl.textContent = '';
         statusEl.className = '';
 
-        // Honeypot: if filled, quietly pretend success.
         if (honeypot && honeypot.value) {
           setStatus('Thanks! Your request has been received.', true);
           form.reset();
           if (categoryInput) categoryInput.value = 'Warranty';
+          syncClaimSubmittedByRequirements();
           return;
         }
 
-        // Let browser highlight built-in validation issues.
         if (!form.reportValidity()) {
           setStatus('Please correct the highlighted fields before submitting.', false);
           return;
         }
 
-        // VIN normalization + custom message.
         const vinRaw = vinInput.value.trim();
         const normalizedVin = vinRaw.toUpperCase().replace(/\s+/g, '');
         if (!validateVIN(normalizedVin)) {
@@ -627,15 +779,12 @@
           vinInput.focus();
           return;
         }
-        // Store normalized VIN back into the field so the server gets it.
         vinInput.value = normalizedVin;
 
-        // Ensure category is still set.
         if (categoryInput && !categoryInput.value) {
           categoryInput.value = 'Warranty';
         }
 
-        // Use FormData so file uploads are included.
         const formData = new FormData(form);
 
         try {
@@ -650,6 +799,7 @@
             setStatus(data.message || 'Submitted. Check your email for confirmation.');
             form.reset();
             if (categoryInput) categoryInput.value = 'Warranty';
+            syncClaimSubmittedByRequirements();
           } else {
             const msg = data.message || `Submission failed (${res.status}). Please try again.`;
             setStatus(msg, false);
