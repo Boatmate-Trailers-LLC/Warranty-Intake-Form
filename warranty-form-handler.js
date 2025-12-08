@@ -418,7 +418,6 @@ export default {
 
     // Only include these lines if values are present, after Warranty Request
     if (labor_rate || labor_hours) {
-
       if (labor_rate) {
         ticketContentLines.push(`Labor Rate: ${labor_rate}`);
       }
@@ -483,30 +482,30 @@ export default {
 
       ticketId = await hsCreateTicket(env, ticketProps);
       console.log("HS ticketId", ticketId);
+    } catch (e) {
+      console.error("HS ticket create failed", e);
+      ticketError = e instanceof Error ? e.message : String(e);
+    }
+
+    // 7b) Associate ticket with Contact and Company (if available)
+    if (ticketId && contactId && env.HUBSPOT_TOKEN) {
+      try {
+        await hsAssociateTicketToContact(env, ticketId, contactId);
+        console.log("Associated ticket to contact", { ticketId, contactId });
       } catch (e) {
-        console.error("HS ticket create failed", e);
-        ticketError = e instanceof Error ? e.message : String(e);
+        console.error("Ticket<->contact association failed", e);
       }
 
-      // 7b) Associate ticket with Contact and Company (if available)
-      if (ticketId && contactId && env.HUBSPOT_TOKEN) {
-        try {
-          await hsAssociateTicketToContact(env, ticketId, contactId);
-          console.log("Associated ticket to contact", { ticketId, contactId });
-        } catch (e) {
-          console.error("Ticket<->contact association failed", e);
+      try {
+        const companyId = await hsGetPrimaryCompanyIdForContact(env, contactId);
+        if (companyId) {
+          await hsAssociateTicketToCompany(env, ticketId, companyId);
+          console.log("Associated ticket to company", { ticketId, companyId });
         }
-
-        try {
-          const companyId = await hsGetPrimaryCompanyIdForContact(env, contactId);
-          if (companyId) {
-            await hsAssociateTicketToCompany(env, ticketId, companyId);
-            console.log("Associated ticket to company", { ticketId, companyId });
-          }
-        } catch (e) {
-          console.error("Ticket<->company association failed", e);
-        }
+      } catch (e) {
+        console.error("Ticket<->company association failed", e);
       }
+    }
 
     // 8) Upload attachments to HubSpot Files + Note with hs_attachment_ids
     let noteId = null;
@@ -545,7 +544,7 @@ export default {
 
     const ref = submission.ref;
 
-    // 9) Confirmation email (Brevo)
+      // 9) Confirmation email (Brevo)
     const emailConfigured =
       env.EMAIL_ENABLED === "true" &&
       !!(env.EMAIL_API_ENDPOINT && env.EMAIL_API_KEY && env.FROM_EMAIL);
@@ -553,18 +552,225 @@ export default {
     let emailStatus = "skipped";
 
     if (emailConfigured) {
-      const subject = `Warranty request received - Claim #${claimNumber}`;
-      const html = `
-        <p>Thanks! We received your warranty request.</p>
-        <p><strong>Claim #:</strong> ${claimNumber}</p>
-        <p><strong>VIN:</strong> ${escapeHtml(vin)}<br/>
-           <strong>Email:</strong> ${escapeHtml(email)}</p>
-        <p>We’ll follow up shortly.</p>
-      `;
-      const text = `Thanks!
-      Claim #: ${claimNumber}
-      VIN: ${vin}
-      Email: ${email}`;
+      // Trailer number / short VIN: 10th char + last 4 chars (positions 14–17)
+      const trailerNumber =
+        vin && vin.length === 17
+          ? vin.charAt(9) + vin.slice(13)
+          : vin;
+
+      const dateSubmitted = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+      const dealerFullName = [dealer_first_name, dealer_last_name].filter(Boolean).join(" ");
+      const customerFullName = [customer_first_name, customer_last_name].filter(Boolean).join(" ");
+
+      const safeTrailerNumber = trailerNumber ? escapeHtml(trailerNumber) : "";
+      const safeVin = escapeHtml(vin);
+      const safeEmail = escapeHtml(email);
+      const safeDealerName = escapeHtml(dealer_name || "N/A");
+      const safeDealerFullName = escapeHtml(dealerFullName || "N/A");
+      const safeDealerEmail = escapeHtml(dealer_email || "N/A");
+      const safeDealerPhone = escapeHtml(dealer_phone || "N/A");
+      const safeDealerAddress = escapeHtml(
+        [
+          dealer_address,
+          dealer_city,
+          dealer_region,
+          dealer_postal_code,
+          dealer_country
+        ]
+          .filter(Boolean)
+          .join(", ") || "N/A"
+      );
+      const safeCustomerFullName = escapeHtml(customerFullName || "N/A");
+      const safeCustomerEmail = escapeHtml(customer_email || "N/A");
+      const safeCustomerPhone = escapeHtml(customer_phone || "N/A");
+      const safeCustomerAddress = escapeHtml(
+        [
+          customer_address,
+          customer_city,
+          customer_region,
+          customer_postal_code,
+          customer_country
+        ]
+          .filter(Boolean)
+          .join(", ") || "N/A"
+      );
+      const safeDateOfOccurrence = escapeHtml(date_of_occurrence || "N/A");
+      const safeShipTo = escapeHtml(ship_to || "N/A");
+
+      const symptomsHtml = escapeHtml(warranty_symptoms || "N/A").replace(/\n/g, "<br/>");
+      const requestHtml = escapeHtml(warranty_request || "N/A").replace(/\n/g, "<br/>");
+
+      const subject = trailerNumber
+        ? `Boatmate Warranty Claim #${claimNumber} received for ${trailerNumber}`
+        : `Boatmate Warranty Claim #${claimNumber} received`;
+
+      const htmlParts = [];
+
+      // Optional logo at the top of the email
+      if (env.EMAIL_LOGO_URL) {
+        const safeLogoUrl = escapeHtml(env.EMAIL_LOGO_URL);
+        htmlParts.push(
+          `<p><img src="${safeLogoUrl}" alt="Boatmate Trailers" style="max-width:200px;height:auto;" /></p>`
+        );
+      }
+
+      htmlParts.push(
+        "<p>Hi there,</p>",
+        "<p>Thanks for submitting your Boatmate warranty request. This email is your record of the information we received. It is not an approval or denial of coverage.</p>",
+        `<p><strong>Claim Summary</strong><br/>
+           Claim #: ${claimNumber}<br/>
+           ${safeTrailerNumber ? `Trailer #: ${safeTrailerNumber}<br/>` : ""}VIN: ${safeVin}<br/>
+           Submitted By: ${escapeHtml(friendlySubmittedBy)}<br/>
+           Original Owner: ${escapeHtml(friendlyOriginalOwner)}<br/>
+           Date Submitted: ${escapeHtml(dateSubmitted)}</p>`,
+        `<p><strong>Dealer Information</strong><br/>
+           Dealership: ${safeDealerName}<br/>
+           Name: ${safeDealerFullName}<br/>
+           Email: ${safeDealerEmail}<br/>
+           Phone: ${safeDealerPhone}<br/>
+           Address: ${safeDealerAddress}</p>`,
+        `<p><strong>Customer Information</strong><br/>
+           Name: ${safeCustomerFullName}<br/>
+           Email: ${safeCustomerEmail}<br/>
+           Phone: ${safeCustomerPhone}<br/>
+           Address: ${safeCustomerAddress}</p>`
+      );
+
+      // --- Warranty Claim Details (HTML) ---
+      const warrantyDetailsHtmlParts = [
+        `<p><strong>Warranty Claim Details</strong><br/>`,
+        `Date of Occurrence: ${safeDateOfOccurrence}<br/>`,
+        `Ship To: ${safeShipTo}<br/>`,
+        `Warranty Symptoms: ${symptomsHtml}<br/>`,
+        `Warranty Request: ${requestHtml}`
+      ];
+
+      if (labor_rate || labor_hours) {
+        const safeLaborRate = labor_rate ? escapeHtml(labor_rate) : "";
+        const safeLaborHours = labor_hours ? escapeHtml(labor_hours) : "";
+
+        if (safeLaborRate) {
+          warrantyDetailsHtmlParts.push(`<br/>Labor Rate: ${safeLaborRate}`);
+        }
+        if (safeLaborHours) {
+          warrantyDetailsHtmlParts.push(`<br/>Labor Hours: ${safeLaborHours}`);
+        }
+      }
+
+      warrantyDetailsHtmlParts.push(`</p>`);
+      htmlParts.push(warrantyDetailsHtmlParts.join(""));
+
+      // --- Attached Files (HTML) ---
+      if (attachmentFileNames.length) {
+        const items = attachmentFileNames
+          .map(name => `<li>${escapeHtml(name)}</li>`)
+          .join("");
+        htmlParts.push(
+          "<p><strong>Attached Files</strong></p>",
+          `<ul>${items}</ul>`
+        );
+      } else {
+        htmlParts.push("<p><strong>Attached Files</strong><br/>None</p>");
+      }
+
+      htmlParts.push(
+        "<p>This email confirms we’ve received your warranty request. Our team will review the claim and follow up with you or your dealer with next steps.</p>",
+        `<p>If any of the details above are incorrect, please reply to this email or contact Boatmate Warranty Support. Please reference <strong>Claim #${claimNumber}</strong> in any future communication.</p>`
+      );
+
+      const html = htmlParts.join("\n");
+
+      // ---------- PLAIN-TEXT VERSION ----------
+      const dealerAddressText =
+        [
+          dealer_address,
+          dealer_city,
+          dealer_region,
+          dealer_postal_code,
+          dealer_country
+        ]
+          .filter(Boolean)
+          .join(", ") || "N/A";
+
+      const customerAddressText =
+        [
+          customer_address,
+          customer_city,
+          customer_region,
+          customer_postal_code,
+          customer_country
+        ]
+          .filter(Boolean)
+          .join(", ") || "N/A";
+
+      // Trailer number / short VIN: 10th char + last 4 (14–17)
+      const trailerNumberText =
+        vin && vin.length === 17
+          ? vin.charAt(9) + vin.slice(13)
+          : "";
+
+      const textLines = [
+        "Thanks for submitting your Boatmate warranty request.",
+        "This email is your record of the information we received. It is not an approval or denial of coverage.",
+        "",
+        "Claim Summary",
+        `Claim #: ${claimNumber}`,
+        trailerNumberText ? `Trailer #: ${trailerNumberText}` : "Trailer #: N/A",
+        `VIN: ${vin}`,
+        `Submitted By: ${friendlySubmittedBy}`,
+        `Original Owner: ${friendlyOriginalOwner}`,
+        `Date Submitted: ${dateSubmitted}`,
+        "",
+        "Dealer Information",
+        `Dealership: ${dealer_name || "N/A"}`,
+        `Name: ${dealerFullName || "N/A"}`,
+        `Email: ${dealer_email || "N/A"}`,
+        `Phone: ${dealer_phone || "N/A"}`,
+        `Address: ${dealerAddressText}`,
+        "",
+        "Customer Information",
+        `Name: ${customerFullName || "N/A"}`,
+        `Email: ${customer_email || "N/A"}`,
+        `Phone: ${customer_phone || "N/A"}`,
+        `Address: ${customerAddressText}`
+      ];
+
+      // Warranty claim details (flat, in the order you wanted)
+      textLines.push(
+        "",
+        "Warranty Claim Details",
+        `Date of Occurrence: ${date_of_occurrence || "N/A"}`,
+        `Ship To: ${ship_to || "N/A"}`,
+        `Warranty Symptoms: ${warranty_symptoms || "N/A"}`,
+        `Warranty Request: ${warranty_request || "N/A"}`
+      );
+
+      // Optional labor fields, only if present (no extra header)
+      if (labor_rate) {
+        textLines.push(`Labor Rate: ${labor_rate}`);
+      }
+
+      if (labor_hours) {
+        textLines.push(`Labor Hours: ${labor_hours}`);
+      }
+
+      // Attached files list
+      if (attachmentFileNames.length) {
+        textLines.push(
+          "Attached Files:",
+          ...attachmentFileNames.map(name => `* ${name}`)
+        );
+      } else {
+        textLines.push("Attached Files: None");
+      }
+
+      textLines.push(
+        "",
+        "This email confirms we’ve received your warranty request. Our team will review the claim and follow up with you or your dealer with next steps.",
+        `If any of the details above are incorrect, please reply to this email or contact Boatmate Warranty Support. Please reference Claim #${claimNumber} in any future communication.`
+      );
+
+      const text = textLines.join("\n");
 
       try {
         await sendEmail(env, { to: email, from: env.FROM_EMAIL, subject, html, text });
@@ -599,7 +805,7 @@ export default {
   }
 };
 
-// ------------------------ CORS helpers ------------------------
+// ------------------------ HTTP / CORS helpers ------------------------
 function handlePreflight(request) {
   const reqMethod = request.headers.get("Access-Control-Request-Method") || "POST";
   const reqHeaders =
@@ -641,6 +847,15 @@ function json(request, body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers });
 }
 
+function escapeHtml(str = "") {
+  return String(str)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 // ------------------------ Email (Brevo) ------------------------
 async function sendEmail(env, { to, from, subject, html, text }) {
   const endpoint = env.EMAIL_API_ENDPOINT || "https://api.brevo.com/v3/smtp/email";
@@ -672,15 +887,6 @@ async function sendEmail(env, { to, from, subject, html, text }) {
     const body = await resp.text().catch(() => "");
     throw new Error(`Brevo send failed ${resp.status}: ${body.slice(0, 300)}`);
   }
-}
-
-function escapeHtml(str = "") {
-  return String(str)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
 }
 
 // ------------------------ HubSpot helpers ------------------------
