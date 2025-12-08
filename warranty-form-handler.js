@@ -28,6 +28,7 @@
  *   - FROM_EMAIL            : Verified Brevo sender email.
  *   - FROM_NAME             : (optional) Friendly sender name.
  *   - REPLY_TO              : (optional) Reply-to address.
+ *   - EMAIL_LOGO_URL        : (optional) HTTPS URL for logo in confirmation email.
  *
  * NOTES
  *   - Keep secrets in env, never in code.
@@ -44,6 +45,10 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 
 const DEV_FALLBACK_STAR = false;
+
+// Attachment limits
+const MAX_ATTACHMENT_FILES = 10;
+const MAX_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB per file
 
 // --------------------- Durable Object: ClaimCounter ---------------------
 export class ClaimCounter {
@@ -71,6 +76,9 @@ export class ClaimCounter {
 // ------------------------------ Worker ------------------------------
 export default {
   async fetch(request, env) {
+    // Per-request reference ID for logging / tracing
+    const ref = crypto.randomUUID();
+
     if (request.method === "OPTIONS") {
       return handlePreflight(request);
     }
@@ -88,6 +96,9 @@ export default {
     let vin = "";
     let category = "Warranty";
     let email = "";
+
+    // Honeypot (bot trap)
+    let honeypot = "";
 
     // “Who is submitting” + original owner
     let claim_submitted_by = ""; // "dealer" | "customer" | ""
@@ -127,6 +138,7 @@ export default {
     // Attachments from form
     const attachmentFiles = [];
     const attachmentFileNames = [];
+    const attachmentErrors = [];
 
     try {
       if (ct.includes("application/json")) {
@@ -167,6 +179,9 @@ export default {
         labor_rate = String(b.labor_rate || "").trim();
         labor_hours = String(b.labor_hours || "").trim();
 
+        // Honeypot (if you ever send it in JSON dev/testing)
+        honeypot = String(b.honeypot || b._hp || "").trim();
+
         // choose primary email based on "who is submitting" (customer > dealer > legacy)
         const legacyEmail = String(b.email || "").trim().toLowerCase();
         if (claim_submitted_by === "dealer") {
@@ -186,6 +201,9 @@ export default {
 
         claim_submitted_by = String(f.get("claim_submitted_by") || "").trim().toLowerCase();
         original_owner = String(f.get("original_owner") || "").trim().toLowerCase();
+
+        // Honeypot (real browser form)
+        honeypot = String(f.get("honeypot") || f.get("_hp") || "").trim();
 
         dealer_name = String(f.get("dealer_name") || "").trim();
         dealer_first_name = String(f.get("dealer_first_name") || "").trim();
@@ -225,16 +243,36 @@ export default {
           email = (customer_email || dealer_email || legacyEmail || "").toLowerCase();
         }
 
-        // Collect real File objects for attachments
+        // Collect real File objects for attachments with basic limits
         for (const [name, value] of f.entries()) {
           if (name === "attachments" && value && typeof value === "object" && "name" in value) {
+            if (attachmentFiles.length >= MAX_ATTACHMENT_FILES) {
+              attachmentErrors.push("Too many attachments. Maximum is 10 files per submission.");
+              break;
+            }
+
+            const size = typeof value.size === "number" ? value.size : 0;
+            if (size && size > MAX_ATTACHMENT_SIZE_BYTES) {
+              attachmentErrors.push(
+                `Attachment "${value.name}" is too large. Maximum size is 10 MB per file.`
+              );
+              break;
+            }
+
             attachmentFiles.push(value);
             if (value.name) attachmentFileNames.push(value.name);
           }
         }
       }
-    } catch {
+    } catch (e) {
+      console.error("Invalid request body", { ref, error: e });
       return json(request, { ok: false, errors: ["Invalid request body"] }, 400);
+    }
+
+    // Honeypot check: if the hidden field is filled, treat as spam and bail early.
+    if (honeypot) {
+      console.warn("Honeypot triggered; dropping submission", { ref, vin, email });
+      return json(request, { ok: true, message: "Submitted." });
     }
 
     // --------- Server-side validation (authoritative) ---------
@@ -245,12 +283,17 @@ export default {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || "")) {
       errors.push("Email is invalid.");
     }
-    if (errors.length) {
-      return json(request, { ok: false, errors }, 400);
+
+    if (errors.length || attachmentErrors.length) {
+      return json(
+        request,
+        { ok: false, errors: [...errors, ...attachmentErrors] },
+        400
+      );
     }
 
     const submission = {
-      ref: crypto.randomUUID(),
+      ref,
       vin,
       email: email.toLowerCase(),
       category,
@@ -297,6 +340,8 @@ export default {
       .fetch("https://counter/next", { method: "POST" })
       .then(r => r.json());
 
+    console.log("Claim number generated", { ref, claimNumber, vin });
+
     // 6) Contact upsert (by primary email)
     let contactId = null;
     try {
@@ -323,9 +368,9 @@ export default {
         customer_email
       };
       contactId = await hsUpsertContact(env, submission.email, contactProps);
-      console.log("HS contactId", contactId);
+      console.log("HS contactId", { ref, claimNumber, contactId });
     } catch (e) {
-      console.error("HS contact upsert failed", e);
+      console.error("HS contact upsert failed", { ref, claimNumber, error: e });
     }
 
     // 7) Ticket create in Warranty pipeline
@@ -481,9 +526,13 @@ export default {
       };
 
       ticketId = await hsCreateTicket(env, ticketProps);
-      console.log("HS ticketId", ticketId);
+      console.log("HS ticketId", { ref, claimNumber, ticketId });
     } catch (e) {
-      console.error("HS ticket create failed", e);
+      console.error("HS ticket create failed", {
+        ref,
+        claimNumber,
+        error: e instanceof Error ? e.message : String(e)
+      });
       ticketError = e instanceof Error ? e.message : String(e);
     }
 
@@ -491,19 +540,27 @@ export default {
     if (ticketId && contactId && env.HUBSPOT_TOKEN) {
       try {
         await hsAssociateTicketToContact(env, ticketId, contactId);
-        console.log("Associated ticket to contact", { ticketId, contactId });
+        console.log("Associated ticket to contact", { ref, claimNumber, ticketId, contactId });
       } catch (e) {
-        console.error("Ticket<->contact association failed", e);
+        console.error("Ticket<->contact association failed", {
+          ref,
+          claimNumber,
+          error: e
+        });
       }
 
       try {
         const companyId = await hsGetPrimaryCompanyIdForContact(env, contactId);
         if (companyId) {
           await hsAssociateTicketToCompany(env, ticketId, companyId);
-          console.log("Associated ticket to company", { ticketId, companyId });
+          console.log("Associated ticket to company", { ref, claimNumber, ticketId, companyId });
         }
       } catch (e) {
-        console.error("Ticket<->company association failed", e);
+        console.error("Ticket<->company association failed", {
+          ref,
+          claimNumber,
+          error: e
+        });
       }
     }
 
@@ -531,10 +588,14 @@ export default {
             attachmentFileIds,
             submission.vin
           );
-          console.log("HS noteId (attachments)", noteId);
+          console.log("HS noteId (attachments)", { ref, claimNumber, noteId });
         }
       } catch (e) {
-        console.error("Attachment upload / note create failed", e);
+        console.error("Attachment upload / note create failed", {
+          ref,
+          claimNumber,
+          error: e
+        });
         attachmentsError =
           e && e.message
             ? `HubSpot error: ${e.message}`
@@ -542,9 +603,7 @@ export default {
       }
     }
 
-    const ref = submission.ref;
-
-      // 9) Confirmation email (Brevo)
+    // 9) Confirmation email (Brevo)
     const emailConfigured =
       env.EMAIL_ENABLED === "true" &&
       !!(env.EMAIL_API_ENDPOINT && env.EMAIL_API_KEY && env.FROM_EMAIL);
@@ -776,7 +835,7 @@ export default {
         await sendEmail(env, { to: email, from: env.FROM_EMAIL, subject, html, text });
         emailStatus = "sent";
       } catch (err) {
-        console.error("Email send failed", err);
+        console.error("Email send failed", { ref, claimNumber, error: err });
         emailStatus = "failed";
       }
     }
