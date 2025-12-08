@@ -488,6 +488,26 @@ export default {
         ticketError = e instanceof Error ? e.message : String(e);
       }
 
+      // 7b) Associate ticket with Contact and Company (if available)
+      if (ticketId && contactId && env.HUBSPOT_TOKEN) {
+        try {
+          await hsAssociateTicketToContact(env, ticketId, contactId);
+          console.log("Associated ticket to contact", { ticketId, contactId });
+        } catch (e) {
+          console.error("Ticket<->contact association failed", e);
+        }
+
+        try {
+          const companyId = await hsGetPrimaryCompanyIdForContact(env, contactId);
+          if (companyId) {
+            await hsAssociateTicketToCompany(env, ticketId, companyId);
+            console.log("Associated ticket to company", { ticketId, companyId });
+          }
+        } catch (e) {
+          console.error("Ticket<->company association failed", e);
+        }
+      }
+
     // 8) Upload attachments to HubSpot Files + Note with hs_attachment_ids
     let noteId = null;
     const attachmentFileIds = [];
@@ -542,9 +562,9 @@ export default {
         <p>We’ll follow up shortly.</p>
       `;
       const text = `Thanks!
-Claim #: ${claimNumber}
-VIN: ${vin}
-Email: ${email}`;
+      Claim #: ${claimNumber}
+      VIN: ${vin}
+      Email: ${email}`;
 
       try {
         await sendEmail(env, { to: email, from: env.FROM_EMAIL, subject, html, text });
@@ -736,6 +756,66 @@ async function hsCreateTicket(env, props) {
     body: JSON.stringify({ properties: props })
   });
   return res?.id || null;
+}
+
+// -------- Associations helpers: Ticket <-> Contact / Company --------
+async function hsAssociateTicketToContact(env, ticketId, contactId) {
+  if (!env.HUBSPOT_TOKEN) {
+    throw new Error("HUBSPOT_TOKEN missing for associations");
+  }
+  if (!ticketId || !contactId) {
+    throw new Error("ticketId and contactId required for ticket<->contact association");
+  }
+
+  // Default unlabeled association between ticket and contact
+  await hsRequest(
+    env,
+    `/crm/v4/objects/ticket/${ticketId}/associations/default/contact/${contactId}`,
+    { method: "PUT" }
+  );
+}
+
+async function hsGetPrimaryCompanyIdForContact(env, contactId) {
+  if (!env.HUBSPOT_TOKEN) {
+    throw new Error("HUBSPOT_TOKEN missing for associations");
+  }
+  if (!contactId) return null;
+
+  const res = await hsRequest(
+    env,
+    `/crm/v4/objects/contact/${contactId}/associations/company`,
+    { method: "GET" }
+  );
+
+  const results = Array.isArray(res?.results) ? res.results : [];
+  if (!results.length) return null;
+
+  // Prefer Primary company (typeId === 1), else fall back to first
+  const primary = results.find(r =>
+    Array.isArray(r.associationTypes) &&
+    r.associationTypes.some(
+      t => t.category === "HUBSPOT_DEFINED" && t.typeId === 1
+    )
+  );
+
+  const picked = primary || results[0];
+  const companyId = picked && picked.toObjectId;
+  return companyId ? String(companyId) : null;
+}
+
+async function hsAssociateTicketToCompany(env, ticketId, companyId) {
+  if (!env.HUBSPOT_TOKEN) {
+    throw new Error("HUBSPOT_TOKEN missing for associations");
+  }
+  if (!ticketId || !companyId) {
+    throw new Error("ticketId and companyId required for ticket<->company association");
+  }
+
+  await hsRequest(
+    env,
+    `/crm/v4/objects/ticket/${ticketId}/associations/default/company/${companyId}`,
+    { method: "PUT" }
+  );
 }
 
 // Cache the note<->ticket associationTypeId so we only look it up once per worker instance
