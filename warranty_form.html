@@ -235,7 +235,7 @@
       cursor: pointer;
       border-radius: 999px;
       border: none;
-      padding: 0.75rem 1.5rem;
+      padding: 0.75rem 2.25rem;
       font-weight: 600;
       background: #1f4f91;
       color: #fff;
@@ -246,12 +246,37 @@
       filter: brightness(1.05);
     }
 
-  /* Warranty Intake — invalid field highlight */
-  #warranty-intake-form .bm-invalid {
-    border-color: #dc3545;
-    outline: 0;
-    box-shadow: 0 0 0 0.15rem rgba(220, 53, 69, 0.25);
-  }
+        /* Loading state for submit button */
+    button[type="submit"].is-loading {
+      position: relative;
+    }
+
+    button[type="submit"].is-loading::after {
+      content: "";
+      position: absolute;
+      right: .75rem;        /* spinner sits near the right edge of the text */
+      top: 50%;
+      width: 1rem;
+      height: 1rem;
+      margin-top: -0.5rem;  /* center vertically */
+      border-radius: 50%;
+      border: 2px solid rgba(255, 255, 255, 0.6);
+      border-top-color: #ffffff;
+      animation: bm-spin 0.8s linear infinite;
+    }
+
+    @keyframes bm-spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    /* Warranty Intake — invalid field highlight */
+    #warranty-intake-form .bm-invalid {
+      border-color: #dc3545;
+      outline: 0;
+      box-shadow: 0 0 0 0.15rem rgba(220, 53, 69, 0.25);
+    }
   </style>
 </head>
 <body>
@@ -656,7 +681,7 @@
     </form>
   </div> <!-- Wrapper end -->
 
-  <script>
+    <script>
   (function () {
     // --------------------------
     // Global element references
@@ -668,6 +693,7 @@
     const vinInput = document.getElementById('vin');
     const categoryInput = document.getElementById('category');
     const honeypot = document.getElementById('website');
+    const submitBtn = form.querySelector('button[type="submit"]');
 
     // "Who is submitting this claim?"
     const claimSubmittedByDealer   = document.getElementById('claim_submitted_by_dealer');
@@ -746,6 +772,29 @@
           input.removeAttribute('required');
         }
       });
+    }
+
+    // Loading state for submit button + form
+    function setSubmitting(isSubmitting) {
+      if (!submitBtn) return;
+
+      if (isSubmitting) {
+        // Remember label, disable button, show spinner, mark form busy
+        if (!submitBtn.dataset.originalText) {
+          submitBtn.dataset.originalText = submitBtn.textContent || 'Submit Warranty Claim';
+        }
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Submitting…';
+        submitBtn.classList.add('is-loading');
+        form.setAttribute('aria-busy', 'true');
+      } else {
+        // Restore label/state
+        const original = submitBtn.dataset.originalText || 'Submit Warranty Claim';
+        submitBtn.disabled = false;
+        submitBtn.textContent = original;
+        submitBtn.classList.remove('is-loading');
+        form.removeAttribute('aria-busy');
+      }
     }
 
     // Custom highlight helpers
@@ -842,6 +891,7 @@
 
       setStatus('');
       clearInvalidHighlights();
+      setSubmitting(false); // ensure clean state before we start
 
       // Honeypot: if filled, quietly pretend success.
       if (honeypot && honeypot.value) {
@@ -884,6 +934,10 @@
       }
       if (vinInput) vinInput.value = normalizedVin;
 
+      // At this point, client-side validation passed; show "Submitting…" state
+      setSubmitting(true);
+      setStatus('Submitting your claim…', true);
+
       // Ensure category is still set.
       if (categoryInput && !categoryInput.value) {
         categoryInput.value = 'Warranty';
@@ -920,6 +974,9 @@
         }
       } catch (err) {
         setStatus('Network error. Please try again in a moment.', false);
+      } finally {
+        // Always clear loading state once we’re done
+        setSubmitting(false);
       }
     }
 
@@ -943,6 +1000,6 @@
     // Submit handler
     form.addEventListener('submit', handleSubmit);
   })();
-</script>
+  </script>
 </body>
 </html>
