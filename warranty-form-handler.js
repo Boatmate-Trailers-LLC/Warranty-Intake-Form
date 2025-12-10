@@ -276,12 +276,81 @@ export default {
     }
 
     // --------- Server-side validation (authoritative) ---------
+    // - Customer Information: always required.
+    // - Warranty Claim Information: always required.
+    // - Dealer Information: required only when 'claim_submitted_by' === 'dealer'.
     const errors = [];
+
+    // VIN is always required and must pass the standard 17-char pattern (no I, O, Q)
     if (!/^[A-HJ-NPR-Z0-9]{17}$/.test(vin)) {
       errors.push("VIN must be 17 chars (no I, O, Q).");
     }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || "")) {
-      errors.push("Email is invalid.");
+
+    // Customer Information — required for all submissions
+    if (!customer_first_name) errors.push("Customer first name is required.");
+    if (!customer_last_name) errors.push("Customer last name is required.");
+    if (!customer_address) errors.push("Customer address is required.");
+    if (!customer_city) errors.push("Customer city is required.");
+    if (!customer_region) errors.push("Customer state/region is required.");
+    if (!customer_postal_code) errors.push("Customer postal/ZIP code is required.");
+    if (!customer_country) errors.push("Customer country is required.");
+    if (!customer_phone) errors.push("Customer phone is required.");
+
+    if (!customer_email) {
+      errors.push("Customer email is required.");
+    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customer_email)) {
+      errors.push("Customer email is invalid.");
+    }
+
+    // Warranty Claim Information — required for all submissions
+    if (!date_of_occurrence) {
+      errors.push("Date of occurrence is required.");
+    }
+    if (!ship_to) {
+      errors.push("Ship-to information is required.");
+    }
+    if (!warranty_symptoms) {
+      errors.push("Warranty symptoms are required.");
+    }
+    if (!warranty_request) {
+      errors.push("Warranty request is required.");
+    }
+    // Note: labor_rate and labor_hours remain optional; they may not apply to all claims.
+
+    // Dealer Information — only required when dealer is submitting the claim
+    if (claim_submitted_by === "dealer") {
+      if (!dealer_name) {
+        errors.push("Dealership name is required when the dealer is submitting the claim.");
+      }
+      if (!dealer_first_name) {
+        errors.push("Dealer first name is required when the dealer is submitting the claim.");
+      }
+      if (!dealer_last_name) {
+        errors.push("Dealer last name is required when the dealer is submitting the claim.");
+      }
+      if (!dealer_address) {
+        errors.push("Dealer address is required when the dealer is submitting the claim.");
+      }
+      if (!dealer_city) {
+        errors.push("Dealer city is required when the dealer is submitting the claim.");
+      }
+      if (!dealer_region) {
+        errors.push("Dealer state/region is required when the dealer is submitting the claim.");
+      }
+      if (!dealer_postal_code) {
+        errors.push("Dealer postal/ZIP code is required when the dealer is submitting the claim.");
+      }
+      if (!dealer_country) {
+        errors.push("Dealer country is required when the dealer is submitting the claim.");
+      }
+      if (!dealer_phone) {
+        errors.push("Dealer phone is required when the dealer is submitting the claim.");
+      }
+      if (!dealer_email) {
+        errors.push("Dealer email is required when the dealer is submitting the claim.");
+      } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(dealer_email)) {
+        errors.push("Dealer email is invalid.");
+      }
     }
 
     if (errors.length || attachmentErrors.length) {
