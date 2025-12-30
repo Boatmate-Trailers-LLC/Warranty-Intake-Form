@@ -1,0 +1,609 @@
+<!--
+  Boatmate — Dealer Warranty Intake Form (Dealer-only)
+  ====================================================
+  PURPOSE
+  - Collects a dealer-submitted warranty claim for Boatmate trailers.
+  - Posts multipart/form-data to a Cloudflare Worker endpoint.
+  - Supports multiple file uploads (up to 10 files, 10MB each).
+
+  IMPORTANT BUSINESS RULES (CURRENT)
+  - Dealer-only form: claim_submitted_by is always "dealer" (hidden field).
+  - Customer Information: FIRST/LAST name only (no customer address/phone/email).
+  - Ship To: REMOVED entirely. Do not collect, validate, or send to the backend.
+  - Labor rate: NOT part of this project. Do not collect or send.
+
+  INTEGRATION ASSUMPTIONS
+  - The Worker returns JSON: { ok: true, claimNumber: <number>, ... } on success
+  - On failure it returns JSON: { ok: false, errors: [...] } (or message)
+
+  MAINTENANCE NOTES
+  - Keep input `name` attributes aligned with the Worker’s form-data parsing.
+  - Keep IDs aligned with the front-end validation list.
+  - Honeypot field name is "website" (hidden). The Worker should accept it.
+
+  FILE: dealer-warranty-intake.html
+-->
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Dealer Warranty Intake</title>
+
+    <style>
+      /* -----------------------------------------------------------------------
+        Base + Theme
+      ------------------------------------------------------------------------ */
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+
+      :root {
+        --bm-bg: #ffffff;
+        --bm-fg: #111827;
+        --bm-muted: #6b7280;
+        --bm-border: #d1d5db;
+        --bm-focus: #2563eb;
+        --bm-error: #dc2626;
+        --bm-success: #16a34a;
+        --bm-radius: 12px;
+      }
+
+      body {
+        margin: 0;
+        padding: 24px;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+        color: var(--bm-fg);
+        background: var(--bm-bg);
+      }
+
+      .wrapper {
+        max-width: 980px;
+        margin: 0 auto;
+      }
+
+      /* -----------------------------------------------------------------------
+        Form + Fieldsets
+      ------------------------------------------------------------------------ */
+      form {
+        border: 1px solid var(--bm-border);
+        border-radius: var(--bm-radius);
+        padding: 18px;
+      }
+
+      fieldset {
+        border: 1px solid var(--bm-border);
+        border-radius: var(--bm-radius);
+        padding: 14px;
+        margin: 0 0 14px;
+      }
+
+      legend {
+        font-weight: 700;
+        padding: 0 8px;
+      }
+
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      label {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+
+      input,
+      select,
+      textarea {
+        width: 100%;
+        padding: 10px 12px;
+        border: 1px solid var(--bm-border);
+        border-radius: 10px;
+        font-size: 14px;
+        background: #fff;
+      }
+
+      input:focus,
+      select:focus,
+      textarea:focus {
+        outline: 2px solid color-mix(in srgb, var(--bm-focus) 70%, transparent);
+        outline-offset: 2px;
+      }
+
+      textarea {
+        min-height: 110px;
+        resize: vertical;
+      }
+
+      small {
+        color: var(--bm-muted);
+        font-size: 12px;
+      }
+
+      /* -----------------------------------------------------------------------
+        Layout Grids
+        - field-grid--two: shared 2-col layout for Dealer + Customer sections
+        - claim-grid: strict 3 rows x 2 cols on desktop for Warranty Claim section
+      ------------------------------------------------------------------------ */
+      .field-grid {
+        display: grid;
+        gap: 14px;
+        align-items: start;
+      }
+
+      .field-grid--two {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      /* Full-width rows inside a 2-column grid */
+      .field-wide {
+        grid-column: 1 / -1;
+      }
+
+      .claim-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+        align-items: start;
+      }
+
+      @media (max-width: 720px) {
+        .field-grid--two {
+          grid-template-columns: 1fr;
+        }
+        .claim-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      /* -----------------------------------------------------------------------
+        Validation + Status
+      ------------------------------------------------------------------------ */
+      .bm-invalid {
+        outline: 2px solid var(--bm-error);
+        outline-offset: 1px;
+        border-color: var(--bm-error);
+      }
+
+      #form-status {
+        font-size: 14px;
+      }
+
+      #form-status.success {
+        color: var(--bm-success);
+      }
+
+      #form-status.error {
+        color: var(--bm-error);
+      }
+
+      /* -----------------------------------------------------------------------
+        Submit Button + Spinner
+      ------------------------------------------------------------------------ */
+      .bm-actions {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+
+      button[type="submit"] {
+        appearance: none;
+        border: 0;
+        border-radius: var(--bm-radius);
+        padding: 12px 14px;
+        font-weight: 700;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      button[disabled] {
+        opacity: 0.7;
+        cursor: not-allowed;
+      }
+
+      .bm-spinner {
+        width: 16px;
+        height: 16px;
+        border-radius: 999px;
+        border: 2px solid currentColor;
+        border-top-color: transparent;
+        display: none;
+        animation: spin 0.8s linear infinite;
+      }
+
+      button.is-loading .bm-spinner {
+        display: inline-block;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      /* -----------------------------------------------------------------------
+        Honeypot (anti-spam) - visually hidden
+      ------------------------------------------------------------------------ */
+      .hp {
+        position: absolute;
+        left: -10000px;
+        top: auto;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div class="wrapper">
+      <form id="warranty-form" novalidate>
+        <!-- Dealer-only: hard-coded submitter -->
+        <input id="claim_submitted_by" type="hidden" name="claim_submitted_by" value="dealer" />
+        <input id="category" type="hidden" name="category" value="Warranty" />
+
+        <!-- Honeypot: bots fill this; humans never see it -->
+        <div class="hp" aria-hidden="true">
+          <label for="website">Website</label>
+          <input id="website" name="website" type="text" tabindex="-1" autocomplete="off" />
+        </div>
+
+        <!-- Dealer Information -->
+        <fieldset>
+          <legend>Dealer Information</legend>
+
+          <div class="field-grid field-grid--two">
+            <div class="field field-wide">
+              <label for="dealer_name">Dealership</label>
+              <input id="dealer_name" name="dealer_name" type="text" required />
+            </div>
+
+            <div class="field">
+              <label for="dealer_first_name">First Name</label>
+              <input id="dealer_first_name" name="dealer_first_name" type="text" required />
+            </div>
+
+            <div class="field">
+              <label for="dealer_last_name">Last Name</label>
+              <input id="dealer_last_name" name="dealer_last_name" type="text" required />
+            </div>
+
+            <div class="field field-wide">
+              <label for="dealer_address">Address</label>
+              <input id="dealer_address" name="dealer_address" type="text" required />
+            </div>
+
+            <div class="field">
+              <label for="dealer_city">City</label>
+              <input id="dealer_city" name="dealer_city" type="text" required />
+            </div>
+
+            <div class="field">
+              <label for="dealer_region">State/Province/Region</label>
+              <input id="dealer_region" name="dealer_region" type="text" required />
+            </div>
+
+            <div class="field">
+              <label for="dealer_postal_code">Zip/Postal Code</label>
+              <input id="dealer_postal_code" name="dealer_postal_code" type="text" required />
+            </div>
+
+            <div class="field">
+              <label for="dealer_country">Country/Region</label>
+              <input id="dealer_country" name="dealer_country" type="text" required />
+            </div>
+
+            <div class="field">
+              <label for="dealer_phone">Phone</label>
+              <input id="dealer_phone" name="dealer_phone" type="tel" required />
+            </div>
+
+            <div class="field">
+              <label for="dealer_email">Email</label>
+              <input id="dealer_email" name="dealer_email" type="email" required />
+            </div>
+          </div>
+        </fieldset>
+
+        <!-- Customer Information (Name Only) -->
+        <fieldset>
+          <legend>Customer Information</legend>
+
+          <div class="field-grid field-grid--two">
+            <div class="field">
+              <label for="customer_first_name">First Name</label>
+              <input id="customer_first_name" name="customer_first_name" type="text" required />
+            </div>
+
+            <div class="field">
+              <label for="customer_last_name">Last Name</label>
+              <input id="customer_last_name" name="customer_last_name" type="text" required />
+            </div>
+          </div>
+        </fieldset>
+
+        <!-- Warranty Claim Information (3 rows × 2 columns) -->
+        <fieldset>
+          <legend>Warranty Claim Information</legend>
+
+          <div class="claim-grid">
+            <!-- Row 1 -->
+            <div class="field">
+              <label for="vin">Trailer VIN</label>
+              <input
+                id="vin"
+                name="vin"
+                type="text"
+                maxlength="17"
+                pattern="[A-HJ-NPR-Z0-9]{17}"
+                autocomplete="off"
+                spellcheck="false"
+                required
+              />
+            </div>
+
+            <div class="field">
+              <label for="date_of_occurrence">Date of Occurrence</label>
+              <input id="date_of_occurrence" name="date_of_occurrence" type="date" required />
+            </div>
+
+            <!-- Row 2 -->
+            <div class="field">
+              <label for="warranty_symptoms">Warranty Symptoms</label>
+              <textarea id="warranty_symptoms" name="warranty_symptoms" rows="5" required></textarea>
+            </div>
+
+            <div class="field">
+              <label for="warranty_request">Warranty Request</label>
+              <textarea id="warranty_request" name="warranty_request" rows="5" required></textarea>
+            </div>
+
+            <!-- Row 3 -->
+            <div class="field">
+              <label for="labor_hours">Warranty Labor Hours</label>
+              <input id="labor_hours" name="labor_hours" type="text" inputmode="decimal" />
+            </div>
+
+            <div class="field">
+              <label for="attachments">File Upload</label>
+              <input id="attachments" name="attachments" type="file" multiple />
+              <small>Up to 10 files. Max 10MB each.</small>
+            </div>
+          </div>
+        </fieldset>
+
+        <!-- Actions / Status -->
+        <div class="bm-actions">
+          <button id="submit-btn" type="submit">
+            <span class="btn-label">Submit Warranty Claim</span>
+            <span class="bm-spinner" aria-hidden="true"></span>
+          </button>
+
+          <span id="form-status" aria-live="polite"></span>
+        </div>
+      </form>
+    </div>
+
+    <script>
+      /**
+       * Dealer Warranty Intake — Front-end Script
+       * ----------------------------------------
+       * Responsibilities:
+       * - Client-side validation (required fields, VIN format, file limits)
+       * - Submit multipart/form-data to the Worker endpoint
+       * - Display success/error status + claim number
+       * - Prevent double submits; show loading state
+       *
+       * NOTE: The backend remains the source of truth for validation.
+       */
+      (() => {
+        // ---------------------------------------------------------------------
+        // Config
+        // ---------------------------------------------------------------------
+        const WARRANTY_ENDPOINT = 'https://warranty-intake-form.boatmate-trailers-llc.workers.dev/';
+
+        // File limits should match (or be <=) backend enforcement.
+        const MAX_FILES = 10;
+        const MAX_FILE_BYTES = 10 * 1024 * 1024; // 10MB
+
+        // ---------------------------------------------------------------------
+        // DOM References
+        // ---------------------------------------------------------------------
+        const form = document.getElementById('warranty-form');
+        const statusEl = document.getElementById('form-status');
+        const submitBtn = document.getElementById('submit-btn');
+        const btnLabel = submitBtn?.querySelector('.btn-label');
+
+        // IDs that must exist and be non-empty for a valid dealer submission.
+        const REQUIRED_IDS = [
+          // Dealer
+          'dealer_name',
+          'dealer_first_name',
+          'dealer_last_name',
+          'dealer_address',
+          'dealer_city',
+          'dealer_region',
+          'dealer_postal_code',
+          'dealer_country',
+          'dealer_phone',
+          'dealer_email',
+
+          // Customer (name only)
+          'customer_first_name',
+          'customer_last_name',
+
+          // Claim
+          'vin',
+          'date_of_occurrence',
+          'warranty_symptoms',
+          'warranty_request'
+        ];
+
+        // ---------------------------------------------------------------------
+        // Small Helpers
+        // ---------------------------------------------------------------------
+        function setStatus(message, ok = true) {
+          if (!statusEl) return;
+          statusEl.textContent = message || '';
+          statusEl.className = ok ? 'success' : 'error';
+        }
+
+        function setSubmitting(isSubmitting) {
+          if (!submitBtn) return;
+
+          submitBtn.disabled = isSubmitting;
+          submitBtn.classList.toggle('is-loading', isSubmitting);
+          form.setAttribute('aria-busy', isSubmitting ? 'true' : 'false');
+
+          // IMPORTANT: Don’t use submitBtn.textContent here (it would remove the spinner span).
+          if (btnLabel) {
+            btnLabel.textContent = isSubmitting ? 'Submitting…' : 'Submit Warranty Claim';
+          }
+        }
+
+        function markInvalid(id) {
+          const el = document.getElementById(id);
+          if (el) el.classList.add('bm-invalid');
+        }
+
+        function clearInvalid() {
+          REQUIRED_IDS.forEach((id) => {
+            const el = document.getElementById(id);
+            if (el) el.classList.remove('bm-invalid');
+          });
+        }
+
+        // VIN format check only (no checksum)
+        function isValidVin(vin) {
+          return /^[A-HJ-NPR-Z0-9]{17}$/.test(String(vin || '').trim().toUpperCase());
+        }
+
+        function validateFiles(fileInput) {
+          const files = fileInput?.files ? Array.from(fileInput.files) : [];
+
+          if (files.length > MAX_FILES) {
+            return `Too many attachments. Maximum is ${MAX_FILES} files per submission.`;
+          }
+
+          for (const f of files) {
+            if (f.size > MAX_FILE_BYTES) {
+              return `Attachment "${f.name}" is too large. Maximum size is 10MB per file.`;
+            }
+          }
+
+          return null;
+        }
+
+        // Lightweight per-field UX: remove red outline once the user edits/fixes a field.
+        function wireFieldValidation() {
+          REQUIRED_IDS.forEach((id) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+
+            const handler = () => {
+              const val = String(el.value || '').trim();
+              if (val) el.classList.remove('bm-invalid');
+            };
+
+            el.addEventListener('input', handler);
+            el.addEventListener('change', handler);
+            el.addEventListener('blur', handler);
+          });
+        }
+
+        // ---------------------------------------------------------------------
+        // Submit Handler
+        // ---------------------------------------------------------------------
+        async function handleSubmit(e) {
+          e.preventDefault();
+          setStatus('');
+          clearInvalid();
+
+          // Normalize VIN to uppercase before validation + submission
+          const vinEl = document.getElementById('vin');
+          if (vinEl) vinEl.value = String(vinEl.value || '').trim().toUpperCase();
+
+          const errors = [];
+
+          // Required field validation
+          for (const id of REQUIRED_IDS) {
+            const el = document.getElementById(id);
+            const val = el ? String(el.value || '').trim() : '';
+
+            if (!val) {
+              errors.push(`${id} is required.`);
+              markInvalid(id);
+            }
+          }
+
+          // VIN format validation
+          if (vinEl && vinEl.value && !isValidVin(vinEl.value)) {
+            errors.push('VIN must be 17 characters (no I, O, Q).');
+            markInvalid('vin');
+          }
+
+          // Attachment validation
+          const fileInput = document.getElementById('attachments');
+          const fileErr = validateFiles(fileInput);
+          if (fileErr) errors.push(fileErr);
+
+          if (errors.length) {
+            // Only show the first error to keep UX clean
+            setStatus(errors[0], false);
+            return;
+          }
+
+          // Build the multipart/form-data payload from the form
+          const formData = new FormData(form);
+
+          setSubmitting(true);
+
+          try {
+            const resp = await fetch(WARRANTY_ENDPOINT, { method: 'POST', body: formData });
+
+            // Worker should return JSON; fall back safely if it doesn’t.
+            const data = await resp.json().catch(() => null);
+
+            if (!resp.ok || !data || data.ok !== true) {
+              const msg =
+                (data && (data.message || (Array.isArray(data.errors) ? data.errors.join(' ') : ''))) ||
+                `Submission failed (HTTP ${resp.status}).`;
+              setStatus(msg, false);
+              return;
+            }
+
+            setStatus(`Submitted successfully. Claim #${data.claimNumber}.`, true);
+
+            // Reset form for the next submission
+            form.reset();
+
+            // Re-apply fixed hidden values after reset
+            const submitter = form.querySelector('input[name="claim_submitted_by"]');
+            const category = form.querySelector('input[name="category"]');
+            if (submitter) submitter.value = 'dealer';
+            if (category) category.value = 'Warranty';
+          } catch (err) {
+            setStatus('Network error while submitting. Please try again.', false);
+          } finally {
+            setSubmitting(false);
+          }
+        }
+
+        // ---------------------------------------------------------------------
+        // Boot
+        // ---------------------------------------------------------------------
+        wireFieldValidation();
+        form.addEventListener('submit', handleSubmit);
+      })();
+    </script>
+  </body>
+</html>
