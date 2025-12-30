@@ -1,39 +1,36 @@
+// warranty-form-handler.js
 /**
- * Boatmate Warranty Intake — Cloudflare Worker
- * ============================================
- * PURPOSE
- *   Backend endpoint for the Boatmate warranty intake form.
+ * Boatmate Warranty Intake — Cloudflare Worker (Dealer Form Only)
+ * ===============================================================
  *
- * WHAT IT DOES
- *   - Handles CORS for allowed origins (boatmateparts.com + local dev).
- *   - Accepts POSTs as JSON or multipart/form-data (for file uploads).
- *   - Normalizes and validates core fields (VIN, email, etc.).
- *   - Issues a strictly-incrementing Claim # via the ClaimCounter Durable Object.
- *   - Upserts a HubSpot Contact using dealer/customer info.
- *   - Creates a HubSpot Ticket in the Warranty pipeline with mapped properties.
- *   - Uploads any attached files to HubSpot Files API.
- *   - Creates a NOTE engagement with those file IDs and associates it to the Ticket
- *     so attachments appear on the Ticket in HubSpot.
- *   - Optionally sends a confirmation email via Brevo (controlled by EMAIL_ENABLED).
+ * WHAT THIS SERVICE DOES
+ * - Receives dealer-submitted warranty claims from the Dealer Warranty Intake HTML form.
+ * - Accepts multipart/form-data (primary) and application/json (supported).
+ * - Validates required fields (dealer + customer name + claim details).
+ * - Generates a sequential claim number via Durable Object (ClaimCounter).
+ * - Upserts a HubSpot Contact (keyed by dealer email).
+ * - Creates a HubSpot Ticket in the Warranty pipeline/stage with structured properties + a readable text body.
+ * - Optionally:
+ *    • associates the ticket to the contact and (if available) their primary company
+ *    • uploads attachments to HubSpot Files (PRIVATE) and creates a Note with attachment IDs
+ *    • sends a confirmation email (Brevo) to the dealer email when configured
  *
- * CONFIG (env vars / bindings)
- *   - CLAIM_COUNTER         : Durable Object binding for the global claim counter.
- *   - HUBSPOT_TOKEN         : HubSpot private app token (contacts, tickets, files, engagements).
- *   - HS_TICKET_PIPELINE    : (optional) Warranty pipeline ID override.
- *   - HS_TICKET_STAGE       : (optional) Warranty stage ID override.
- *   - HS_FILES_FOLDER_PATH  : (optional) Folder path for uploaded files in HubSpot Files.
- *   - EMAIL_ENABLED         : "true" to send confirmation emails; anything else = skip.
- *   - EMAIL_API_ENDPOINT    : Brevo SMTP endpoint (defaults if unset).
- *   - EMAIL_API_KEY         : Brevo transactional API key.
- *   - FROM_EMAIL            : Verified Brevo sender email.
- *   - FROM_NAME             : (optional) Friendly sender name.
- *   - REPLY_TO              : (optional) Reply-to address.
- *   - EMAIL_LOGO_URL        : (optional) HTTPS URL for logo in confirmation email.
+ * HARD BUSINESS RULES (CURRENT)
+ * - Dealer-only submissions: claim_submitted_by MUST equal "dealer".
+ * - Customer Information: FIRST/LAST ONLY (no customer address/phone/email).
+ * - "Ship To" is removed entirely: do not parse, validate, store, or map it.
+ * - Labor rate is NOT part of this project: do not parse, validate, store, or map it.
  *
- * NOTES
- *   - Keep secrets in env, never in code.
- *   - If HubSpot scopes change (files/tickets/contacts), update HUBSPOT_TOKEN.
- *   - Engagements API is used for attachments so no notes-specific scope is required.
+ * ANTI-SPAM
+ * - Honeypot supports: "honeypot", "_hp", and "website".
+ * - If honeypot is filled, respond OK without processing (silent drop).
+ *
+ * RUNTIME
+ * - Cloudflare Workers (Module syntax) + Durable Objects
+ *
+ * FILE UPLOADS
+ * - Up to 10 files per submission
+ * - Max 10MB per file
  */
 
 const ALLOWED_ORIGINS = new Set([
@@ -44,13 +41,25 @@ const ALLOWED_ORIGINS = new Set([
   "http://www.boatmateparts.com"
 ]);
 
+// If true, returns "*" for Access-Control-Allow-Origin when origin is not in ALLOWED_ORIGINS.
+// Keep false for production safety.
 const DEV_FALLBACK_STAR = false;
 
-// Attachment limits
+// Attachment limits (should match your front-end)
 const MAX_ATTACHMENT_FILES = 10;
-const MAX_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB per file
+const MAX_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024; // 10MB per file
 
-// --------------------- Durable Object: ClaimCounter ---------------------
+// HubSpot API base
+const HS_BASE = "https://api.hubapi.com";
+
+/* -------------------------------------------------------------------------- */
+/* Durable Object: ClaimCounter                                               */
+/* -------------------------------------------------------------------------- */
+/**
+ * Stores an integer counter and returns the next value.
+ * - Storage key: "n"
+ * - Starts at 100000, returns 100001+ sequentially
+ */
 export class ClaimCounter {
   constructor(state, env) {
     this.state = state;
@@ -59,6 +68,7 @@ export class ClaimCounter {
 
   async fetch(request) {
     const url = new URL(request.url);
+
     if (request.method !== "POST" || url.pathname !== "/next") {
       return new Response("Not found", { status: 404 });
     }
@@ -73,16 +83,17 @@ export class ClaimCounter {
   }
 }
 
-// ------------------------------ Worker ------------------------------
+/* -------------------------------------------------------------------------- */
+/* Worker                                                                      */
+/* -------------------------------------------------------------------------- */
 export default {
   async fetch(request, env) {
-    // Per-request reference ID for logging / tracing
     const ref = crypto.randomUUID();
 
-    if (request.method === "OPTIONS") {
-      return handlePreflight(request);
-    }
+    // CORS preflight
+    if (request.method === "OPTIONS") return handlePreflight(request);
 
+    // Only POST supported
     if (request.method !== "POST") {
       return new Response("Method Not Allowed", {
         status: 405,
@@ -90,818 +101,246 @@ export default {
       });
     }
 
-    const ct = (request.headers.get("content-type") || "").toLowerCase();
+    const contentType = (request.headers.get("content-type") || "").toLowerCase();
 
-    // Core fields
-    let vin = "";
-    let category = "Warranty";
-    let email = "";
+    // Parsed payload values (initialize everything explicitly)
+    const parsed = initParsedPayload();
 
-    // Honeypot (bot trap)
-    let honeypot = "";
+    // File collection (from multipart)
+    const attachments = {
+      files: [],
+      fileNames: [],
+      errors: []
+    };
 
-    // “Who is submitting” + original owner
-    let claim_submitted_by = ""; // "dealer" | "customer" | ""
-    let original_owner = "";     // "yes" | "no" | ""
-
-    // Dealer fields
-    let dealer_name = "";
-    let dealer_first_name = "";
-    let dealer_last_name = "";
-    let dealer_address = "";
-    let dealer_city = "";
-    let dealer_region = "";
-    let dealer_postal_code = "";
-    let dealer_country = "";
-    let dealer_phone = "";
-    let dealer_email = "";
-
-    // Customer fields
-    let customer_first_name = "";
-    let customer_last_name = "";
-    let customer_address = "";
-    let customer_city = "";
-    let customer_region = "";
-    let customer_postal_code = "";
-    let customer_country = "";
-    let customer_phone = "";
-    let customer_email = "";
-
-    // Warranty fields
-    let date_of_occurrence = "";
-    let ship_to = "";
-    let warranty_symptoms = "";
-    let warranty_request = "";
-    let labor_rate = "";
-    let labor_hours = "";
-
-    // Attachments from form
-    const attachmentFiles = [];
-    const attachmentFileNames = [];
-    const attachmentErrors = [];
-
+    // -------------------- Parse incoming request --------------------
     try {
-      if (ct.includes("application/json")) {
-        // ---------- JSON path (dev/testing, no real File objects) ----------
-        const b = await request.json().catch(() => ({}));
-
-        vin = String(b.vin || "").trim().toUpperCase();
-        category = b.category ? String(b.category).trim() : "Warranty";
-
-        claim_submitted_by = String(b.claim_submitted_by || "").trim().toLowerCase();
-        original_owner = String(b.original_owner || "").trim().toLowerCase();
-
-        dealer_name = String(b.dealer_name || "").trim();
-        dealer_first_name = String(b.dealer_first_name || "").trim();
-        dealer_last_name = String(b.dealer_last_name || "").trim();
-        dealer_address = String(b.dealer_address || "").trim();
-        dealer_city = String(b.dealer_city || "").trim();
-        dealer_region = String(b.dealer_region || "").trim();
-        dealer_postal_code = String(b.dealer_postal_code || "").trim();
-        dealer_country = String(b.dealer_country || "").trim();
-        dealer_phone = String(b.dealer_phone || "").trim();
-        dealer_email = String(b.dealer_email || "").trim().toLowerCase();
-
-        customer_first_name = String(b.customer_first_name || "").trim();
-        customer_last_name = String(b.customer_last_name || "").trim();
-        customer_address = String(b.customer_address || "").trim();
-        customer_city = String(b.customer_city || "").trim();
-        customer_region = String(b.customer_region || "").trim();
-        customer_postal_code = String(b.customer_postal_code || "").trim();
-        customer_country = String(b.customer_country || "").trim();
-        customer_phone = String(b.customer_phone || "").trim();
-        customer_email = String(b.customer_email || "").trim().toLowerCase();
-
-        date_of_occurrence = String(b.date_of_occurrence || "").trim();
-        ship_to = String(b.ship_to || "").trim();
-        warranty_symptoms = String(b.warranty_symptoms || "").trim();
-        warranty_request = String(b.warranty_request || "").trim();
-        labor_rate = String(b.labor_rate || "").trim();
-        labor_hours = String(b.labor_hours || "").trim();
-
-        // Honeypot (if you ever send it in JSON dev/testing)
-        honeypot = String(b.honeypot || b._hp || "").trim();
-
-        // choose primary email based on "who is submitting" (customer > dealer > legacy)
-        const legacyEmail = String(b.email || "").trim().toLowerCase();
-        if (claim_submitted_by === "dealer") {
-          email = (dealer_email || legacyEmail || "").toLowerCase();
-        } else if (claim_submitted_by === "customer") {
-          email = (customer_email || legacyEmail || "").toLowerCase();
-        } else {
-          email = (customer_email || dealer_email || legacyEmail || "").toLowerCase();
-        }
+      if (contentType.includes("application/json")) {
+        const body = await request.json().catch(() => ({}));
+        parseJsonBodyInto(parsed, body);
       } else {
-        // ---------- multipart/form-data (real browser form with files) ----------
-        const f = await request.formData();
-
-        vin = String(f.get("vin") || "").trim().toUpperCase();
-        const cat = f.get("category");
-        if (cat) category = String(cat).trim();
-
-        claim_submitted_by = String(f.get("claim_submitted_by") || "").trim().toLowerCase();
-        original_owner = String(f.get("original_owner") || "").trim().toLowerCase();
-
-        // Honeypot (real browser form)
-        honeypot = String(f.get("honeypot") || f.get("_hp") || "").trim();
-
-        dealer_name = String(f.get("dealer_name") || "").trim();
-        dealer_first_name = String(f.get("dealer_first_name") || "").trim();
-        dealer_last_name = String(f.get("dealer_last_name") || "").trim();
-        dealer_address = String(f.get("dealer_address") || "").trim();
-        dealer_city = String(f.get("dealer_city") || "").trim();
-        dealer_region = String(f.get("dealer_region") || "").trim();
-        dealer_postal_code = String(f.get("dealer_postal_code") || "").trim();
-        dealer_country = String(f.get("dealer_country") || "").trim();
-        dealer_phone = String(f.get("dealer_phone") || "").trim();
-        dealer_email = String(f.get("dealer_email") || "").trim().toLowerCase();
-
-        customer_first_name = String(f.get("customer_first_name") || "").trim();
-        customer_last_name = String(f.get("customer_last_name") || "").trim();
-        customer_address = String(f.get("customer_address") || "").trim();
-        customer_city = String(f.get("customer_city") || "").trim();
-        customer_region = String(f.get("customer_region") || "").trim();
-        customer_postal_code = String(f.get("customer_postal_code") || "").trim();
-        customer_country = String(f.get("customer_country") || "").trim();
-        customer_phone = String(f.get("customer_phone") || "").trim();
-        customer_email = String(f.get("customer_email") || "").trim().toLowerCase();
-
-        date_of_occurrence = String(f.get("date_of_occurrence") || "").trim();
-        ship_to = String(f.get("ship_to") || "").trim();
-        warranty_symptoms = String(f.get("warranty_symptoms") || "").trim();
-        warranty_request = String(f.get("warranty_request") || "").trim();
-        labor_rate = String(f.get("labor_rate") || "").trim();
-        labor_hours = String(f.get("labor_hours") || "").trim();
-
-        // pick primary email based on "who is submitting" (customer > dealer > legacy "email")
-        const legacyEmail = String(f.get("email") || "").trim().toLowerCase();
-        if (claim_submitted_by === "dealer") {
-          email = (dealer_email || legacyEmail || "").toLowerCase();
-        } else if (claim_submitted_by === "customer") {
-          email = (customer_email || legacyEmail || "").toLowerCase();
-        } else {
-          email = (customer_email || dealer_email || legacyEmail || "").toLowerCase();
-        }
-
-        // Collect real File objects for attachments with basic limits
-        for (const [name, value] of f.entries()) {
-          if (name === "attachments" && value && typeof value === "object" && "name" in value) {
-            if (attachmentFiles.length >= MAX_ATTACHMENT_FILES) {
-              attachmentErrors.push("Too many attachments. Maximum is 10 files per submission.");
-              break;
-            }
-
-            const size = typeof value.size === "number" ? value.size : 0;
-            if (size && size > MAX_ATTACHMENT_SIZE_BYTES) {
-              attachmentErrors.push(
-                `Attachment "${value.name}" is too large. Maximum size is 10 MB per file.`
-              );
-              break;
-            }
-
-            attachmentFiles.push(value);
-            if (value.name) attachmentFileNames.push(value.name);
-          }
-        }
+        const form = await request.formData();
+        parseFormDataInto(parsed, form, attachments);
       }
-    } catch (e) {
-      console.error("Invalid request body", { ref, error: e });
-      return json(request, { ok: false, errors: ["Invalid request body"] }, 400);
+    } catch (err) {
+      console.error("Invalid request body", { ref, error: err });
+      return jsonResponse(request, { ok: false, errors: ["Invalid request body"] }, 400);
     }
 
-    // Honeypot check: if the hidden field is filled, treat as spam and bail early.
-    if (honeypot) {
-      console.warn("Honeypot triggered; dropping submission", { ref, vin, email });
-      return json(request, { ok: true, message: "Submitted." });
+    // -------------------- Honeypot: silent drop --------------------
+    if (parsed.honeypot) {
+      console.warn("Honeypot triggered; dropping submission", {
+        ref,
+        vin: parsed.vin,
+        dealer_email: parsed.dealer_email
+      });
+      return jsonResponse(request, { ok: true, message: "Submitted." });
     }
 
-    // --------- Server-side validation (authoritative) ---------
-    // - Customer Information: always required.
-    // - Warranty Claim Information: always required.
-    // - Dealer Information: required only when 'claim_submitted_by' === 'dealer'.
-    const errors = [];
+    // -------------------- Validate (hard changeover; dealer-only) --------------------
+    const errors = validateDealerSubmission(parsed);
 
-    // VIN is always required and must pass the standard 17-char pattern (no I, O, Q)
-    if (!/^[A-HJ-NPR-Z0-9]{17}$/.test(vin)) {
-      errors.push("VIN must be 17 chars (no I, O, Q).");
-    }
-
-    // Customer Information — required for all submissions
-    if (!customer_first_name) errors.push("Customer first name is required.");
-    if (!customer_last_name) errors.push("Customer last name is required.");
-    if (!customer_address) errors.push("Customer address is required.");
-    if (!customer_city) errors.push("Customer city is required.");
-    if (!customer_region) errors.push("Customer state/region is required.");
-    if (!customer_postal_code) errors.push("Customer postal/ZIP code is required.");
-    if (!customer_country) errors.push("Customer country is required.");
-    if (!customer_phone) errors.push("Customer phone is required.");
-
-    if (!customer_email) {
-      errors.push("Customer email is required.");
-    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customer_email)) {
-      errors.push("Customer email is invalid.");
-    }
-
-    // Warranty Claim Information — required for all submissions
-    if (!date_of_occurrence) {
-      errors.push("Date of occurrence is required.");
-    }
-    if (!ship_to) {
-      errors.push("Ship-to information is required.");
-    }
-    if (!warranty_symptoms) {
-      errors.push("Warranty symptoms are required.");
-    }
-    if (!warranty_request) {
-      errors.push("Warranty request is required.");
-    }
-    // Note: labor_rate and labor_hours remain optional; they may not apply to all claims.
-
-    // Dealer Information — only required when dealer is submitting the claim
-    if (claim_submitted_by === "dealer") {
-      if (!dealer_name) {
-        errors.push("Dealership name is required when the dealer is submitting the claim.");
-      }
-      if (!dealer_first_name) {
-        errors.push("Dealer first name is required when the dealer is submitting the claim.");
-      }
-      if (!dealer_last_name) {
-        errors.push("Dealer last name is required when the dealer is submitting the claim.");
-      }
-      if (!dealer_address) {
-        errors.push("Dealer address is required when the dealer is submitting the claim.");
-      }
-      if (!dealer_city) {
-        errors.push("Dealer city is required when the dealer is submitting the claim.");
-      }
-      if (!dealer_region) {
-        errors.push("Dealer state/region is required when the dealer is submitting the claim.");
-      }
-      if (!dealer_postal_code) {
-        errors.push("Dealer postal/ZIP code is required when the dealer is submitting the claim.");
-      }
-      if (!dealer_country) {
-        errors.push("Dealer country is required when the dealer is submitting the claim.");
-      }
-      if (!dealer_phone) {
-        errors.push("Dealer phone is required when the dealer is submitting the claim.");
-      }
-      if (!dealer_email) {
-        errors.push("Dealer email is required when the dealer is submitting the claim.");
-      } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(dealer_email)) {
-        errors.push("Dealer email is invalid.");
-      }
-    }
-
-    if (errors.length || attachmentErrors.length) {
-      return json(
+    if (errors.length || attachments.errors.length) {
+      return jsonResponse(
         request,
-        { ok: false, errors: [...errors, ...attachmentErrors] },
+        { ok: false, errors: [...errors, ...attachments.errors] },
         400
       );
     }
 
-    const submission = {
-      ref,
-      vin,
-      email: email.toLowerCase(),
-      category,
-      claim_submitted_by,
-      original_owner,
-      contact: {
-        dealer_name,
-        dealer_first_name,
-        dealer_last_name,
-        dealer_address,
-        dealer_city,
-        dealer_region,
-        dealer_postal_code,
-        dealer_country,
-        dealer_phone,
-        dealer_email,
-        customer_first_name,
-        customer_last_name,
-        customer_address,
-        customer_city,
-        customer_region,
-        customer_postal_code,
-        customer_country,
-        customer_phone,
-        customer_email
-      },
-      ticket: {
-        trailer_vin: vin,
-        warranty_date_of_occurrence: date_of_occurrence,
-        warranty_ship_to: ship_to,
-        warranty_symptoms,
-        warranty_request,
-        warranty_labor_rate: labor_rate,
-        warranty_labor_hours: labor_hours,
-        hs_file_upload: attachmentFileNames.join(", "),
-        hs_ticket_category: category
-      }
-    };
+    // Canonical submission email (dealer email is the only email on this form)
+    const submissionEmail = parsed.dealer_email.toLowerCase();
 
-    // 5) Claim number via Durable Object
-    const doId = env.CLAIM_COUNTER.idFromName("global");
-    const doStub = env.CLAIM_COUNTER.get(doId);
-    const { n: claimNumber } = await doStub
-      .fetch("https://counter/next", { method: "POST" })
-      .then(r => r.json());
-
-    console.log("Claim number generated", { ref, claimNumber, vin });
-
-    // 6) Contact upsert (by primary email)
-    let contactId = null;
+    // -------------------- Claim number via Durable Object --------------------
+    let claimNumber;
     try {
-      const contactProps = {
-        email: submission.email,
-        dealer: dealer_name,
-        dealer_first_name,
-        dealer_last_name,
-        dealer_address,
-        dealer_city,
-        dealer_state: dealer_region,
-        dealer_zip: dealer_postal_code,
-        dealer_country,
-        dealer_phone,
-        dealer_email,
-        customer_first_name,
-        customer_last_name,
-        customer_address,
-        customer_city,
-        customer_state: customer_region,
-        customer_zip: customer_postal_code,
-        customer_country,
-        customer_phone,
-        customer_email
-      };
-      contactId = await hsUpsertContact(env, submission.email, contactProps);
-      console.log("HS contactId", { ref, claimNumber, contactId });
-    } catch (e) {
-      console.error("HS contact upsert failed", { ref, claimNumber, error: e });
+      claimNumber = await nextClaimNumber(env);
+      console.log("Claim number generated", { ref, claimNumber, vin: parsed.vin });
+    } catch (err) {
+      console.error("Claim number generation failed", { ref, error: err });
+      return jsonResponse(request, { ok: false, errors: ["Unable to generate claim number"] }, 500);
     }
 
-    // 7) Ticket create in Warranty pipeline
+    // -------------------- HubSpot: upsert Contact (by dealer email) --------------------
+    let contactId = null;
+    try {
+      const contactProps = compactProps({
+        email: submissionEmail,
+
+        // HubSpot contact properties (align to your portal’s naming)
+        dealer: parsed.dealer_name,
+        dealer_first_name: parsed.dealer_first_name,
+        dealer_last_name: parsed.dealer_last_name,
+        dealer_address: parsed.dealer_address,
+        dealer_city: parsed.dealer_city,
+        dealer_state: parsed.dealer_region,
+        dealer_zip: parsed.dealer_postal_code,
+        dealer_country: parsed.dealer_country,
+        dealer_phone: parsed.dealer_phone,
+        dealer_email: submissionEmail,
+
+        // Customer name only (by design)
+        customer_first_name: parsed.customer_first_name,
+        customer_last_name: parsed.customer_last_name
+      });
+
+      contactId = await hsUpsertContact(env, submissionEmail, contactProps);
+      console.log("HS contactId", { ref, claimNumber, contactId });
+    } catch (err) {
+      // Non-fatal — ticket can still be created
+      console.error("HS contact upsert failed", { ref, claimNumber, error: err });
+    }
+
+    // -------------------- HubSpot: create Ticket --------------------
     let ticketId = null;
     let ticketError = null;
 
-    // Friendly strings
-    const friendlySubmittedBy =
-      claim_submitted_by === "dealer"
-        ? "Dealer"
-        : claim_submitted_by === "customer"
-        ? "Trailer Owner"
-        : "N/A";
+    const trailerNumber = getTrailerNumberFromVin(parsed.vin);
+    const dealerContactName = joinName(parsed.dealer_first_name, parsed.dealer_last_name);
+    const customerName = joinName(parsed.customer_first_name, parsed.customer_last_name);
 
-    const friendlyOriginalOwner =
-      original_owner === "yes"
-        ? "Yes"
-        : original_owner === "no"
-        ? "No"
-        : original_owner
-        ? original_owner
-        : "N/A";
+    const subjectLine = `Warranty Claim #${claimNumber} - ${
+      parsed.dealer_name || dealerContactName || "Dealer"
+    } - ${trailerNumber}`;
 
-    // Build nicely separated content sections (no Category / Attachments section)
-    const ticketContentLines = [
-      "Warranty intake via website form.",
-      "",
-      `Claim #: ${claimNumber}`,
-      `VIN: ${submission.vin}`
-    ];
-
-    if (claim_submitted_by) {
-      ticketContentLines.push(`Submitted By: ${friendlySubmittedBy}`);
-    }
-
-    ticketContentLines.push(
-      "",
-      "=== Dealer Information ===",
-      `Dealership: ${dealer_name || "N/A"}`,
-      `Name: ${
-        [dealer_first_name, dealer_last_name].filter(Boolean).join(" ") || "N/A"
-      }`,
-      `Email: ${dealer_email || "N/A"}`,
-      `Phone: ${dealer_phone || "N/A"}`,
-      `Address: ${
-        [
-          dealer_address,
-          dealer_city,
-          dealer_region,
-          dealer_postal_code,
-          dealer_country
-        ]
-          .filter(Boolean)
-          .join(", ") || "N/A"
-      }`,
-      "",
-      "=== Customer Information ===",
-      `Name: ${
-        [customer_first_name, customer_last_name].filter(Boolean).join(" ") || "N/A"
-      }`,
-      `Email: ${customer_email || "N/A"}`,
-      `Phone: ${customer_phone || "N/A"}`,
-      `Address: ${
-        [
-          customer_address,
-          customer_city,
-          customer_region,
-          customer_postal_code,
-          customer_country
-        ]
-          .filter(Boolean)
-          .join(", ") || "N/A"
-      }`
-    );
-
-    if (claim_submitted_by === "customer") {
-      ticketContentLines.push(`Original Owner: ${friendlyOriginalOwner}`);
-    }
-
-    ticketContentLines.push(
-      "",
-      "=== Warranty Claim Information ===",
-      `Date of Occurrence: ${date_of_occurrence || "N/A"}`,
-      `Ship To: ${ship_to || "N/A"}`,
-      "Warranty Symptoms:",
-      warranty_symptoms || "N/A",
-      "Warranty Request:",
-      warranty_request || "N/A"
-    );
-
-    // Only include these lines if values are present, after Warranty Request
-    if (labor_rate || labor_hours) {
-      if (labor_rate) {
-        ticketContentLines.push(`Labor Rate: ${labor_rate}`);
+    const ticketContent = buildTicketContent({
+      claimNumber,
+      vin: parsed.vin,
+      dealer: {
+        name: parsed.dealer_name,
+        contactName: dealerContactName,
+        email: submissionEmail,
+        phone: parsed.dealer_phone,
+        address: joinAddress([
+          parsed.dealer_address,
+          parsed.dealer_city,
+          parsed.dealer_region,
+          parsed.dealer_postal_code,
+          parsed.dealer_country
+        ])
+      },
+      customerName,
+      claim: {
+        date_of_occurrence: parsed.date_of_occurrence,
+        warranty_symptoms: parsed.warranty_symptoms,
+        warranty_request: parsed.warranty_request,
+        labor_hours: parsed.labor_hours
       }
-
-      if (labor_hours) {
-        ticketContentLines.push(`Labor Hours: ${labor_hours}`);
-      }
-    }
-
-    const ticketContent = ticketContentLines.join("\n");
+    });
 
     try {
       const pipeline = env.HS_TICKET_PIPELINE || "760934225";
       const stage = env.HS_TICKET_STAGE || "1108043102"; // New
 
-      // Trailer number / short VIN: 10th char + last 4 chars (positions 14–17)
-      const trailerNumber =
-        vin && vin.length === 17
-          ? vin.charAt(9) + vin.slice(13) // e.g., VIN 5A7BB2221ST004529 -> S4529
-          : vin; // fallback to full VIN if something is off
-
-      // Build subject line with dealer / trailer owner name
-      const dealerFullName = [dealer_first_name, dealer_last_name].filter(Boolean).join(" ");
-      const customerFullName = [customer_first_name, customer_last_name].filter(Boolean).join(" ");
-
-      let subjectName = "";
-
-      if (claim_submitted_by === "customer") {
-        // Trailer owner -> customer full name
-        subjectName = customerFullName;
-      } else if (claim_submitted_by === "dealer") {
-        // Dealer -> dealership name
-        subjectName = dealer_name;
-      }
-
-      // Fallbacks if claim_submitted_by is missing or names are blank
-      if (!subjectName) {
-        subjectName = customerFullName || dealer_name || dealerFullName;
-      }
-
-      const subjectLine = subjectName
-        ? `Warranty Claim #${claimNumber} - ${subjectName} - ${trailerNumber}`
-        : `Warranty Claim #${claimNumber} - ${trailerNumber}`;
-
-      const ticketProps = {
+      const ticketProps = compactProps({
         hs_pipeline: pipeline,
         hs_pipeline_stage: stage,
+
         subject: subjectLine,
         content: ticketContent,
-        trailer_vin: submission.ticket.trailer_vin,
-        warranty_date_of_occurrence: submission.ticket.warranty_date_of_occurrence,
-        warranty_ship_to: submission.ticket.warranty_ship_to,
-        warranty_symptoms: submission.ticket.warranty_symptoms,
-        warranty_request: submission.ticket.warranty_request,
-        warranty_labor_rate: submission.ticket.warranty_labor_rate,
-        warranty_labor_hours: submission.ticket.warranty_labor_hours,
-        hs_file_upload: submission.ticket.hs_file_upload,
-        hs_ticket_category: submission.ticket.hs_ticket_category,
-        claim_submitted_by,
-        original_owner
-      };
+
+        // Ticket properties your portal expects
+        trailer_vin: parsed.vin,
+        warranty_date_of_occurrence: parsed.date_of_occurrence,
+        warranty_symptoms: parsed.warranty_symptoms,
+        warranty_request: parsed.warranty_request,
+        warranty_labor_hours: parsed.labor_hours || undefined,
+
+        hs_file_upload: attachments.fileNames.join(", "),
+        hs_ticket_category: parsed.category,
+
+        // Internal classification
+        claim_submitted_by: parsed.claim_submitted_by
+      });
 
       ticketId = await hsCreateTicket(env, ticketProps);
       console.log("HS ticketId", { ref, claimNumber, ticketId });
-    } catch (e) {
-      console.error("HS ticket create failed", {
-        ref,
-        claimNumber,
-        error: e instanceof Error ? e.message : String(e)
-      });
-      ticketError = e instanceof Error ? e.message : String(e);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("HS ticket create failed", { ref, claimNumber, error: msg });
+      ticketError = msg;
     }
 
-    // 7b) Associate ticket with Contact and Company (if available)
+    // -------------------- HubSpot: associate ticket to Contact + Company --------------------
     if (ticketId && contactId && env.HUBSPOT_TOKEN) {
+      // Ticket ↔ Contact
       try {
         await hsAssociateTicketToContact(env, ticketId, contactId);
         console.log("Associated ticket to contact", { ref, claimNumber, ticketId, contactId });
-      } catch (e) {
-        console.error("Ticket<->contact association failed", {
-          ref,
-          claimNumber,
-          error: e
-        });
+      } catch (err) {
+        console.error("Ticket<->contact association failed", { ref, claimNumber, error: err });
       }
 
+      // Ticket ↔ Primary Company (if contact has one)
       try {
         const companyId = await hsGetPrimaryCompanyIdForContact(env, contactId);
         if (companyId) {
           await hsAssociateTicketToCompany(env, ticketId, companyId);
           console.log("Associated ticket to company", { ref, claimNumber, ticketId, companyId });
         }
-      } catch (e) {
-        console.error("Ticket<->company association failed", {
-          ref,
-          claimNumber,
-          error: e
-        });
+      } catch (err) {
+        console.error("Ticket<->company association failed", { ref, claimNumber, error: err });
       }
     }
 
-    // 8) Upload attachments to HubSpot Files + Note with hs_attachment_ids
+    // -------------------- HubSpot: upload attachments + create a Note --------------------
     let noteId = null;
     const attachmentFileIds = [];
     let attachmentsError = null;
 
-    if (ticketId && attachmentFiles.length && env.HUBSPOT_TOKEN) {
+    if (ticketId && attachments.files.length && env.HUBSPOT_TOKEN) {
       try {
-        // 8a) Upload files to HubSpot Files
-        for (const file of attachmentFiles) {
+        for (const file of attachments.files) {
           const uploaded = await hsUploadFile(env, file);
-          if (uploaded && uploaded.id) {
-            attachmentFileIds.push(String(uploaded.id));
-          }
+          if (uploaded?.id) attachmentFileIds.push(String(uploaded.id));
         }
 
-        // 8b) Create a Note associated to the Ticket with hs_attachment_ids
         if (attachmentFileIds.length) {
-          noteId = await hsCreateNoteWithAttachments(
-            env,
-            ticketId,
-            claimNumber,
-            attachmentFileIds,
-            submission.vin
-          );
+          noteId = await hsCreateNoteWithAttachments(env, ticketId, claimNumber, attachmentFileIds, parsed.vin);
           console.log("HS noteId (attachments)", { ref, claimNumber, noteId });
         }
-      } catch (e) {
-        console.error("Attachment upload / note create failed", {
-          ref,
-          claimNumber,
-          error: e
-        });
-        attachmentsError =
-          e && e.message
-            ? `HubSpot error: ${e.message}`
-            : "Unknown error while creating attachment note";
+      } catch (err) {
+        console.error("Attachment upload / note create failed", { ref, claimNumber, error: err });
+        attachmentsError = err?.message ? `HubSpot error: ${err.message}` : "Unknown error while creating attachment note";
       }
     }
 
-    // 9) Confirmation email (Brevo)
+    // -------------------- Confirmation Email (Brevo) --------------------
     const emailConfigured =
       env.EMAIL_ENABLED === "true" &&
-      !!(env.EMAIL_API_ENDPOINT && env.EMAIL_API_KEY && env.FROM_EMAIL);
+      Boolean(env.EMAIL_API_ENDPOINT && env.EMAIL_API_KEY && env.FROM_EMAIL);
 
     let emailStatus = "skipped";
 
     if (emailConfigured) {
-      // Trailer number / short VIN: 10th char + last 4 chars (positions 14–17)
-      const trailerNumber =
-        vin && vin.length === 17
-          ? vin.charAt(9) + vin.slice(13)
-          : vin;
-
-      const dateSubmitted = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-      const dealerFullName = [dealer_first_name, dealer_last_name].filter(Boolean).join(" ");
-      const customerFullName = [customer_first_name, customer_last_name].filter(Boolean).join(" ");
-
-      const safeTrailerNumber = trailerNumber ? escapeHtml(trailerNumber) : "";
-      const safeVin = escapeHtml(vin);
-      const safeEmail = escapeHtml(email);
-      const safeDealerName = escapeHtml(dealer_name || "N/A");
-      const safeDealerFullName = escapeHtml(dealerFullName || "N/A");
-      const safeDealerEmail = escapeHtml(dealer_email || "N/A");
-      const safeDealerPhone = escapeHtml(dealer_phone || "N/A");
-      const safeDealerAddress = escapeHtml(
-        [
-          dealer_address,
-          dealer_city,
-          dealer_region,
-          dealer_postal_code,
-          dealer_country
-        ]
-          .filter(Boolean)
-          .join(", ") || "N/A"
-      );
-      const safeCustomerFullName = escapeHtml(customerFullName || "N/A");
-      const safeCustomerEmail = escapeHtml(customer_email || "N/A");
-      const safeCustomerPhone = escapeHtml(customer_phone || "N/A");
-      const safeCustomerAddress = escapeHtml(
-        [
-          customer_address,
-          customer_city,
-          customer_region,
-          customer_postal_code,
-          customer_country
-        ]
-          .filter(Boolean)
-          .join(", ") || "N/A"
-      );
-      const safeDateOfOccurrence = escapeHtml(date_of_occurrence || "N/A");
-      const safeShipTo = escapeHtml(ship_to || "N/A");
-
-      const symptomsHtml = escapeHtml(warranty_symptoms || "N/A").replace(/\n/g, "<br/>");
-      const requestHtml = escapeHtml(warranty_request || "N/A").replace(/\n/g, "<br/>");
-
-      const subject = trailerNumber
-        ? `Boatmate Warranty Claim #${claimNumber} received for ${trailerNumber}`
-        : `Boatmate Warranty Claim #${claimNumber} received`;
-
-      const htmlParts = [];
-
-      // Optional logo at the top of the email
-      if (env.EMAIL_LOGO_URL) {
-        const safeLogoUrl = escapeHtml(env.EMAIL_LOGO_URL);
-        htmlParts.push(
-          `<p><img src="${safeLogoUrl}" alt="Boatmate Trailers" style="max-width:200px;height:auto;" /></p>`
-        );
-      }
-
-      htmlParts.push(
-        "<p>Hi there,</p>",
-        "<p>Thanks for submitting your Boatmate warranty request. This email is your record of the information we received. It is not an approval or denial of coverage.</p>",
-        `<p><strong>Claim Summary</strong><br/>
-           Claim #: ${claimNumber}<br/>
-           ${safeTrailerNumber ? `Trailer #: ${safeTrailerNumber}<br/>` : ""}VIN: ${safeVin}<br/>
-           Submitted By: ${escapeHtml(friendlySubmittedBy)}<br/>
-           Original Owner: ${escapeHtml(friendlyOriginalOwner)}<br/>
-           Date Submitted: ${escapeHtml(dateSubmitted)}</p>`,
-        `<p><strong>Dealer Information</strong><br/>
-           Dealership: ${safeDealerName}<br/>
-           Name: ${safeDealerFullName}<br/>
-           Email: ${safeDealerEmail}<br/>
-           Phone: ${safeDealerPhone}<br/>
-           Address: ${safeDealerAddress}</p>`,
-        `<p><strong>Customer Information</strong><br/>
-           Name: ${safeCustomerFullName}<br/>
-           Email: ${safeCustomerEmail}<br/>
-           Phone: ${safeCustomerPhone}<br/>
-           Address: ${safeCustomerAddress}</p>`
-      );
-
-      // --- Warranty Claim Details (HTML) ---
-      const warrantyDetailsHtmlParts = [
-        `<p><strong>Warranty Claim Details</strong><br/>`,
-        `Date of Occurrence: ${safeDateOfOccurrence}<br/>`,
-        `Ship To: ${safeShipTo}<br/>`,
-        `Warranty Symptoms: ${symptomsHtml}<br/>`,
-        `Warranty Request: ${requestHtml}`
-      ];
-
-      if (labor_rate || labor_hours) {
-        const safeLaborRate = labor_rate ? escapeHtml(labor_rate) : "";
-        const safeLaborHours = labor_hours ? escapeHtml(labor_hours) : "";
-
-        if (safeLaborRate) {
-          warrantyDetailsHtmlParts.push(`<br/>Labor Rate: ${safeLaborRate}`);
-        }
-        if (safeLaborHours) {
-          warrantyDetailsHtmlParts.push(`<br/>Labor Hours: ${safeLaborHours}`);
-        }
-      }
-
-      warrantyDetailsHtmlParts.push(`</p>`);
-      htmlParts.push(warrantyDetailsHtmlParts.join(""));
-
-      // --- Attached Files (HTML) ---
-      if (attachmentFileNames.length) {
-        const items = attachmentFileNames
-          .map(name => `<li>${escapeHtml(name)}</li>`)
-          .join("");
-        htmlParts.push(
-          "<p><strong>Attached Files</strong></p>",
-          `<ul>${items}</ul>`
-        );
-      } else {
-        htmlParts.push("<p><strong>Attached Files</strong><br/>None</p>");
-      }
-
-      htmlParts.push(
-        "<p>This email confirms we’ve received your warranty request. Our team will review the claim and follow up with you or your dealer with next steps.</p>",
-        `<p>If any of the details above are incorrect, please reply to this email or contact Boatmate Warranty Support. Please reference <strong>Claim #${claimNumber}</strong> in any future communication.</p>`
-      );
-
-      const html = htmlParts.join("\n");
-
-      // ---------- PLAIN-TEXT VERSION ----------
-      const dealerAddressText =
-        [
-          dealer_address,
-          dealer_city,
-          dealer_region,
-          dealer_postal_code,
-          dealer_country
-        ]
-          .filter(Boolean)
-          .join(", ") || "N/A";
-
-      const customerAddressText =
-        [
-          customer_address,
-          customer_city,
-          customer_region,
-          customer_postal_code,
-          customer_country
-        ]
-          .filter(Boolean)
-          .join(", ") || "N/A";
-
-      // Trailer number / short VIN: 10th char + last 4 (14–17)
-      const trailerNumberText =
-        vin && vin.length === 17
-          ? vin.charAt(9) + vin.slice(13)
-          : "";
-
-      const textLines = [
-        "Thanks for submitting your Boatmate warranty request.",
-        "This email is your record of the information we received. It is not an approval or denial of coverage.",
-        "",
-        "Claim Summary",
-        `Claim #: ${claimNumber}`,
-        trailerNumberText ? `Trailer #: ${trailerNumberText}` : "Trailer #: N/A",
-        `VIN: ${vin}`,
-        `Submitted By: ${friendlySubmittedBy}`,
-        `Original Owner: ${friendlyOriginalOwner}`,
-        `Date Submitted: ${dateSubmitted}`,
-        "",
-        "Dealer Information",
-        `Dealership: ${dealer_name || "N/A"}`,
-        `Name: ${dealerFullName || "N/A"}`,
-        `Email: ${dealer_email || "N/A"}`,
-        `Phone: ${dealer_phone || "N/A"}`,
-        `Address: ${dealerAddressText}`,
-        "",
-        "Customer Information",
-        `Name: ${customerFullName || "N/A"}`,
-        `Email: ${customer_email || "N/A"}`,
-        `Phone: ${customer_phone || "N/A"}`,
-        `Address: ${customerAddressText}`
-      ];
-
-      // Warranty claim details (flat, in the order you wanted)
-      textLines.push(
-        "",
-        "Warranty Claim Details",
-        `Date of Occurrence: ${date_of_occurrence || "N/A"}`,
-        `Ship To: ${ship_to || "N/A"}`,
-        `Warranty Symptoms: ${warranty_symptoms || "N/A"}`,
-        `Warranty Request: ${warranty_request || "N/A"}`
-      );
-
-      // Optional labor fields, only if present (no extra header)
-      if (labor_rate) {
-        textLines.push(`Labor Rate: ${labor_rate}`);
-      }
-
-      if (labor_hours) {
-        textLines.push(`Labor Hours: ${labor_hours}`);
-      }
-
-      // Attached files list
-      if (attachmentFileNames.length) {
-        textLines.push(
-          "Attached Files:",
-          ...attachmentFileNames.map(name => `* ${name}`)
-        );
-      } else {
-        textLines.push("Attached Files: None");
-      }
-
-      textLines.push(
-        "",
-        "This email confirms we’ve received your warranty request. Our team will review the claim and follow up with you or your dealer with next steps.",
-        `If any of the details above are incorrect, please reply to this email or contact Boatmate Warranty Support. Please reference Claim #${claimNumber} in any future communication.`
-      );
-
-      const text = textLines.join("\n");
-
       try {
-        await sendEmail(env, { to: email, from: env.FROM_EMAIL, subject, html, text });
+        const emailPayload = buildConfirmationEmail({
+          env,
+          claimNumber,
+          trailerNumber,
+          vin: parsed.vin,
+          date_of_occurrence: parsed.date_of_occurrence,
+          dealer: {
+            name: parsed.dealer_name,
+            contactName: dealerContactName,
+            email: submissionEmail,
+            phone: parsed.dealer_phone,
+            address: joinAddress([
+              parsed.dealer_address,
+              parsed.dealer_city,
+              parsed.dealer_region,
+              parsed.dealer_postal_code,
+              parsed.dealer_country
+            ])
+          },
+          customerName,
+          warranty_symptoms: parsed.warranty_symptoms,
+          warranty_request: parsed.warranty_request,
+          labor_hours: parsed.labor_hours,
+          attachmentFileNames: attachments.fileNames
+        });
+
+        await sendEmail(env, emailPayload);
         emailStatus = "sent";
       } catch (err) {
         console.error("Email send failed", { ref, claimNumber, error: err });
@@ -913,10 +352,11 @@ export default {
       emailStatus === "sent"
         ? "Submitted. Confirmation email sent."
         : emailStatus === "failed"
-        ? "Submitted. Email delivery is currently unavailable; we’ll follow up."
-        : "Submitted. (Email not configured in this environment.)";
+          ? "Submitted. Email delivery is currently unavailable; we’ll follow up."
+          : "Submitted. (Email not configured in this environment.)";
 
-    return json(request, {
+    // -------------------- Response --------------------
+    return jsonResponse(request, {
       ok: true,
       claimNumber,
       ref,
@@ -926,18 +366,351 @@ export default {
       emailStatus,
       message,
       ticketError,
-      attachmentFileNames,
+      attachmentFileNames: attachments.fileNames,
       attachmentFileIds,
       attachmentsError
     });
   }
 };
 
-// ------------------------ HTTP / CORS helpers ------------------------
+/* -------------------------------------------------------------------------- */
+/* Parsing                                                                      */
+/* -------------------------------------------------------------------------- */
+
+function initParsedPayload() {
+  return {
+    // Core
+    vin: "",
+    category: "Warranty",
+    claim_submitted_by: "",
+
+    // Honeypot
+    honeypot: "",
+
+    // Dealer
+    dealer_name: "",
+    dealer_first_name: "",
+    dealer_last_name: "",
+    dealer_address: "",
+    dealer_city: "",
+    dealer_region: "",
+    dealer_postal_code: "",
+    dealer_country: "",
+    dealer_phone: "",
+    dealer_email: "",
+
+    // Customer (name only)
+    customer_first_name: "",
+    customer_last_name: "",
+
+    // Warranty
+    date_of_occurrence: "",
+    warranty_symptoms: "",
+    warranty_request: "",
+    labor_hours: ""
+  };
+}
+
+function parseJsonBodyInto(out, b) {
+  out.vin = toUpperTrim(b.vin);
+  out.category = toTrim(b.category) || "Warranty";
+  out.claim_submitted_by = toLowerTrim(b.claim_submitted_by);
+
+  // Dealer
+  out.dealer_name = toTrim(b.dealer_name);
+  out.dealer_first_name = toTrim(b.dealer_first_name);
+  out.dealer_last_name = toTrim(b.dealer_last_name);
+  out.dealer_address = toTrim(b.dealer_address);
+  out.dealer_city = toTrim(b.dealer_city);
+  out.dealer_region = toTrim(b.dealer_region);
+  out.dealer_postal_code = toTrim(b.dealer_postal_code);
+  out.dealer_country = toTrim(b.dealer_country);
+  out.dealer_phone = toTrim(b.dealer_phone);
+  out.dealer_email = toLowerTrim(b.dealer_email);
+
+  // Customer (name only)
+  out.customer_first_name = toTrim(b.customer_first_name);
+  out.customer_last_name = toTrim(b.customer_last_name);
+
+  // Warranty
+  out.date_of_occurrence = toTrim(b.date_of_occurrence);
+  out.warranty_symptoms = toTrim(b.warranty_symptoms);
+  out.warranty_request = toTrim(b.warranty_request);
+  out.labor_hours = toTrim(b.labor_hours);
+
+  // Honeypot aliases
+  out.honeypot = toTrim(b.honeypot || b._hp || b.website);
+}
+
+function parseFormDataInto(out, f, attachments) {
+  out.vin = toUpperTrim(f.get("vin"));
+  out.category = toTrim(f.get("category")) || "Warranty";
+  out.claim_submitted_by = toLowerTrim(f.get("claim_submitted_by"));
+
+  // Honeypot aliases
+  out.honeypot = toTrim(f.get("honeypot") || f.get("_hp") || f.get("website"));
+
+  // Dealer
+  out.dealer_name = toTrim(f.get("dealer_name"));
+  out.dealer_first_name = toTrim(f.get("dealer_first_name"));
+  out.dealer_last_name = toTrim(f.get("dealer_last_name"));
+  out.dealer_address = toTrim(f.get("dealer_address"));
+  out.dealer_city = toTrim(f.get("dealer_city"));
+  out.dealer_region = toTrim(f.get("dealer_region"));
+  out.dealer_postal_code = toTrim(f.get("dealer_postal_code"));
+  out.dealer_country = toTrim(f.get("dealer_country"));
+  out.dealer_phone = toTrim(f.get("dealer_phone"));
+  out.dealer_email = toLowerTrim(f.get("dealer_email"));
+
+  // Customer (name only)
+  out.customer_first_name = toTrim(f.get("customer_first_name"));
+  out.customer_last_name = toTrim(f.get("customer_last_name"));
+
+  // Warranty
+  out.date_of_occurrence = toTrim(f.get("date_of_occurrence"));
+  out.warranty_symptoms = toTrim(f.get("warranty_symptoms")); // REQUIRED
+  out.warranty_request = toTrim(f.get("warranty_request"));
+  out.labor_hours = toTrim(f.get("labor_hours"));
+
+  // Attachments
+  // NOTE: We only accept <input name="attachments" type="file" multiple>.
+  const all = f.getAll("attachments") || [];
+  for (const value of all) {
+    if (!looksLikeFile(value)) continue;
+
+    if (attachments.files.length >= MAX_ATTACHMENT_FILES) {
+      attachments.errors.push(`Too many attachments. Maximum is ${MAX_ATTACHMENT_FILES} files per submission.`);
+      break;
+    }
+
+    if (typeof value.size === "number" && value.size > MAX_ATTACHMENT_SIZE_BYTES) {
+      attachments.errors.push(`Attachment "${value.name}" is too large. Maximum size is 10 MB per file.`);
+      break;
+    }
+
+    attachments.files.push(value);
+    if (value.name) attachments.fileNames.push(value.name);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Validation                                                                   */
+/* -------------------------------------------------------------------------- */
+
+function validateDealerSubmission(p) {
+  const errors = [];
+
+  // Dealer-only hard changeover
+  if (p.claim_submitted_by !== "dealer") {
+    errors.push("claim_submitted_by must be 'dealer'.");
+  }
+
+  // VIN format (no checksum)
+  if (!isValidVin(p.vin)) {
+    errors.push("VIN must be 17 chars (no I, O, Q).");
+  }
+
+  // Dealer required
+  if (!p.dealer_name) errors.push("Dealership is required.");
+  if (!p.dealer_first_name) errors.push("Dealer first name is required.");
+  if (!p.dealer_last_name) errors.push("Dealer last name is required.");
+  if (!p.dealer_address) errors.push("Dealer address is required.");
+  if (!p.dealer_city) errors.push("Dealer city is required.");
+  if (!p.dealer_region) errors.push("Dealer state/region is required.");
+  if (!p.dealer_postal_code) errors.push("Dealer postal/ZIP code is required.");
+  if (!p.dealer_country) errors.push("Dealer country is required.");
+  if (!p.dealer_phone) errors.push("Dealer phone is required.");
+
+  if (!p.dealer_email) {
+    errors.push("Dealer email is required.");
+  } else if (!isValidEmail(p.dealer_email)) {
+    errors.push("Dealer email is invalid.");
+  }
+
+  // Customer name only (required)
+  if (!p.customer_first_name) errors.push("Customer first name is required.");
+  if (!p.customer_last_name) errors.push("Customer last name is required.");
+
+  // Warranty required
+  if (!p.date_of_occurrence) errors.push("Date of occurrence is required.");
+  if (!p.warranty_symptoms) errors.push("Warranty symptoms are required.");
+  if (!p.warranty_request) errors.push("Warranty request is required.");
+
+  return errors;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Claim Number                                                                 */
+/* -------------------------------------------------------------------------- */
+
+async function nextClaimNumber(env) {
+  const id = env.CLAIM_COUNTER.idFromName("global");
+  const stub = env.CLAIM_COUNTER.get(id);
+
+  const res = await stub.fetch("https://counter/next", { method: "POST" });
+  const data = await res.json();
+
+  if (!data || typeof data.n !== "number") {
+    throw new Error("ClaimCounter returned invalid payload");
+  }
+
+  return data.n;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Ticket + Email Content Builders                                              */
+/* -------------------------------------------------------------------------- */
+
+function buildTicketContent({ claimNumber, vin, dealer, customerName, claim }) {
+  const lines = [
+    "Warranty intake via website dealer form.",
+    "",
+    `Claim #: ${claimNumber}`,
+    `VIN: ${vin}`,
+    "",
+    "=== Dealer Information ===",
+    `Dealership: ${dealer.name || "N/A"}`,
+    `Dealer Contact: ${dealer.contactName || "N/A"}`,
+    `Email: ${dealer.email || "N/A"}`,
+    `Phone: ${dealer.phone || "N/A"}`,
+    `Address: ${dealer.address || "N/A"}`,
+    "",
+    "=== Customer Information ===",
+    `Name: ${customerName || "N/A"}`,
+    "",
+    "=== Warranty Claim Information ===",
+    `Date of Occurrence: ${claim.date_of_occurrence || "N/A"}`,
+    "Warranty Symptoms:",
+    claim.warranty_symptoms || "N/A",
+    "Warranty Request:",
+    claim.warranty_request || "N/A"
+  ];
+
+  if (claim.labor_hours) lines.push(`Labor Hours: ${claim.labor_hours}`);
+
+  return lines.join("\n");
+}
+
+function buildConfirmationEmail({
+  env,
+  claimNumber,
+  trailerNumber,
+  vin,
+  date_of_occurrence,
+  dealer,
+  customerName,
+  warranty_symptoms,
+  warranty_request,
+  labor_hours,
+  attachmentFileNames
+}) {
+  const dateSubmitted = new Date().toISOString().slice(0, 10);
+
+  const subject = trailerNumber
+    ? `Boatmate Warranty Claim #${claimNumber} received for ${trailerNumber}`
+    : `Boatmate Warranty Claim #${claimNumber} received`;
+
+  const symptomsHtml = escapeHtml(warranty_symptoms).replace(/\n/g, "<br/>");
+  const requestHtml = escapeHtml(warranty_request).replace(/\n/g, "<br/>");
+
+  const htmlParts = [];
+
+  if (env.EMAIL_LOGO_URL) {
+    htmlParts.push(
+      `<p><img src="${escapeHtml(env.EMAIL_LOGO_URL)}" alt="Boatmate Trailers" style="max-width:200px;height:auto;" /></p>`
+    );
+  }
+
+  htmlParts.push(
+    "<p>Hi there,</p>",
+    "<p>Thanks for submitting your Boatmate warranty request. This email is your record of the information we received. It is not an approval or denial of coverage.</p>",
+    `<p><strong>Claim Summary</strong><br/>
+      Claim #: ${claimNumber}<br/>
+      ${trailerNumber ? `Trailer #: ${escapeHtml(trailerNumber)}<br/>` : ""}
+      VIN: ${escapeHtml(vin)}<br/>
+      Date Submitted: ${escapeHtml(dateSubmitted)}</p>`,
+    `<p><strong>Dealer Information</strong><br/>
+      Dealership: ${escapeHtml(dealer.name)}<br/>
+      Contact: ${escapeHtml(dealer.contactName)}<br/>
+      Email: ${escapeHtml(dealer.email)}<br/>
+      Phone: ${escapeHtml(dealer.phone)}<br/>
+      Address: ${escapeHtml(dealer.address)}</p>`,
+    `<p><strong>Customer Information</strong><br/>
+      Name: ${escapeHtml(customerName)}</p>`,
+    `<p><strong>Warranty Claim Details</strong><br/>
+      Date of Occurrence: ${escapeHtml(date_of_occurrence)}<br/>
+      Warranty Symptoms: ${symptomsHtml}<br/>
+      Warranty Request: ${requestHtml}${labor_hours ? `<br/>Labor Hours: ${escapeHtml(labor_hours)}` : ""}</p>`
+  );
+
+  if (attachmentFileNames?.length) {
+    const items = attachmentFileNames.map(n => `<li>${escapeHtml(n)}</li>`).join("");
+    htmlParts.push("<p><strong>Attached Files</strong></p>", `<ul>${items}</ul>`);
+  } else {
+    htmlParts.push("<p><strong>Attached Files</strong><br/>None</p>");
+  }
+
+  htmlParts.push(
+    "<p>Our team will review the claim and follow up with next steps.</p>",
+    `<p>Please reference <strong>Claim #${claimNumber}</strong> in any future communication.</p>`
+  );
+
+  const textLines = [
+    "Thanks for submitting your Boatmate warranty request.",
+    "This email is your record of the information we received. It is not an approval or denial of coverage.",
+    "",
+    "Claim Summary",
+    `Claim #: ${claimNumber}`,
+    trailerNumber ? `Trailer #: ${trailerNumber}` : "Trailer #: N/A",
+    `VIN: ${vin}`,
+    `Date Submitted: ${dateSubmitted}`,
+    "",
+    "Dealer Information",
+    `Dealership: ${dealer.name}`,
+    `Contact: ${dealer.contactName}`,
+    `Email: ${dealer.email}`,
+    `Phone: ${dealer.phone}`,
+    `Address: ${dealer.address}`,
+    "",
+    "Customer Information",
+    `Name: ${customerName}`,
+    "",
+    "Warranty Claim Details",
+    `Date of Occurrence: ${date_of_occurrence}`,
+    `Warranty Symptoms: ${warranty_symptoms}`,
+    `Warranty Request: ${warranty_request}`
+  ];
+
+  if (labor_hours) textLines.push(`Labor Hours: ${labor_hours}`);
+
+  if (attachmentFileNames?.length) {
+    textLines.push("Attached Files:", ...attachmentFileNames.map(n => `* ${n}`));
+  } else {
+    textLines.push("Attached Files: None");
+  }
+
+  textLines.push(
+    "",
+    "Our team will review the claim and follow up with next steps.",
+    `Please reference Claim #${claimNumber} in any future communication.`
+  );
+
+  return {
+    to: dealer.email,
+    from: env.FROM_EMAIL,
+    subject,
+    html: htmlParts.join("\n"),
+    text: textLines.join("\n")
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* HTTP / CORS                                                                  */
+/* -------------------------------------------------------------------------- */
+
 function handlePreflight(request) {
   const reqMethod = request.headers.get("Access-Control-Request-Method") || "POST";
-  const reqHeaders =
-    request.headers.get("Access-Control-Request-Headers") || "content-type";
+  const reqHeaders = request.headers.get("Access-Control-Request-Headers") || "content-type";
   const origin = request.headers.get("Origin") || "";
 
   return new Response(null, {
@@ -954,8 +727,8 @@ function handlePreflight(request) {
 
 function corsHeaders(request) {
   const origin = request.headers.get("Origin") || "";
-  const reqHeaders =
-    request.headers.get("Access-Control-Request-Headers") || "content-type";
+  const reqHeaders = request.headers.get("Access-Control-Request-Headers") || "content-type";
+
   return {
     "Access-Control-Allow-Origin": allowOrigin(origin),
     "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -970,24 +743,24 @@ function allowOrigin(origin) {
   return DEV_FALLBACK_STAR ? "*" : "";
 }
 
-function json(request, body, status = 200) {
-  const headers = { "content-type": "application/json", ...corsHeaders(request) };
-  return new Response(JSON.stringify(body), { status, headers });
+function jsonResponse(request, body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      ...corsHeaders(request)
+    }
+  });
 }
 
-function escapeHtml(str = "") {
-  return String(str)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
+/* -------------------------------------------------------------------------- */
+/* Email (Brevo)                                                                */
+/* -------------------------------------------------------------------------- */
 
-// ------------------------ Email (Brevo) ------------------------
 async function sendEmail(env, { to, from, subject, html, text }) {
   const endpoint = env.EMAIL_API_ENDPOINT || "https://api.brevo.com/v3/smtp/email";
   const apiKey = env.EMAIL_API_KEY;
+
   const fromEmail = from || env.FROM_EMAIL;
   const fromName = env.FROM_NAME || undefined;
   const replyTo = env.REPLY_TO || undefined;
@@ -1007,7 +780,10 @@ async function sendEmail(env, { to, from, subject, html, text }) {
 
   const resp = await fetch(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "api-key": apiKey },
+    headers: {
+      "Content-Type": "application/json",
+      "api-key": apiKey
+    },
     body: JSON.stringify(payload)
   });
 
@@ -1017,11 +793,13 @@ async function sendEmail(env, { to, from, subject, html, text }) {
   }
 }
 
-// ------------------------ HubSpot helpers ------------------------
-const HS_BASE = "https://api.hubapi.com";
+/* -------------------------------------------------------------------------- */
+/* HubSpot Helpers                                                              */
+/* -------------------------------------------------------------------------- */
 
-// JSON-only HubSpot helper (NOT for multipart)
 async function hsRequest(env, path, init = {}) {
+  if (!env.HUBSPOT_TOKEN) throw new Error("HUBSPOT_TOKEN missing");
+
   const url = `${HS_BASE}${path}`;
   const headers = new Headers(init.headers || {});
   headers.set("Authorization", `Bearer ${env.HUBSPOT_TOKEN}`);
@@ -1030,21 +808,22 @@ async function hsRequest(env, path, init = {}) {
   const resp = await fetch(url, { ...init, headers });
   const text = await resp.text();
 
-  let json = {};
+  let data = {};
   if (text) {
     try {
-      json = JSON.parse(text);
+      data = JSON.parse(text);
     } catch {
-      json = {};
+      data = {};
     }
   }
 
   if (!resp.ok) {
-    const code = json?.status || resp.status;
-    const msg = json?.message || json?.error || `HTTP ${resp.status}`;
+    const code = data?.status || resp.status;
+    const msg = data?.message || data?.error || `HTTP ${resp.status}`;
     throw new Error(`HubSpot ${code}: ${msg}`);
   }
-  return json;
+
+  return data;
 }
 
 async function hsFindContactByEmail(env, email) {
@@ -1055,11 +834,13 @@ async function hsFindContactByEmail(env, email) {
     properties: ["email"],
     limit: 1
   };
+
   const res = await hsRequest(env, "/crm/v3/objects/contacts/search", {
     method: "POST",
     body: JSON.stringify(body)
   });
-  const hit = Array.isArray(res?.results) && res.results[0];
+
+  const hit = Array.isArray(res?.results) ? res.results[0] : null;
   return hit ? hit.id : null;
 }
 
@@ -1068,11 +849,11 @@ async function hsCreateContact(env, props) {
     method: "POST",
     body: JSON.stringify({ properties: props })
   });
+
   return res?.id || null;
 }
 
 async function hsUpsertContact(env, email, props = {}) {
-  if (!env.HUBSPOT_TOKEN) throw new Error("HUBSPOT_TOKEN missing");
   if (!email) throw new Error("Email required for contact upsert");
 
   const existingId = await hsFindContactByEmail(env, email);
@@ -1081,6 +862,7 @@ async function hsUpsertContact(env, email, props = {}) {
   const createProps = { email: email.toLowerCase(), ...props };
   const newId = await hsCreateContact(env, createProps);
   if (!newId) throw new Error("Failed to create contact");
+
   return newId;
 }
 
@@ -1089,19 +871,15 @@ async function hsCreateTicket(env, props) {
     method: "POST",
     body: JSON.stringify({ properties: props })
   });
+
   return res?.id || null;
 }
 
-// -------- Associations helpers: Ticket <-> Contact / Company --------
-async function hsAssociateTicketToContact(env, ticketId, contactId) {
-  if (!env.HUBSPOT_TOKEN) {
-    throw new Error("HUBSPOT_TOKEN missing for associations");
-  }
-  if (!ticketId || !contactId) {
-    throw new Error("ticketId and contactId required for ticket<->contact association");
-  }
+/* ----------------------------- Associations ------------------------------ */
 
-  // Default unlabeled association between ticket and contact
+async function hsAssociateTicketToContact(env, ticketId, contactId) {
+  if (!ticketId || !contactId) throw new Error("ticketId and contactId required");
+
   await hsRequest(
     env,
     `/crm/v4/objects/ticket/${ticketId}/associations/default/contact/${contactId}`,
@@ -1110,40 +888,28 @@ async function hsAssociateTicketToContact(env, ticketId, contactId) {
 }
 
 async function hsGetPrimaryCompanyIdForContact(env, contactId) {
-  if (!env.HUBSPOT_TOKEN) {
-    throw new Error("HUBSPOT_TOKEN missing for associations");
-  }
   if (!contactId) return null;
 
-  const res = await hsRequest(
-    env,
-    `/crm/v4/objects/contact/${contactId}/associations/company`,
-    { method: "GET" }
-  );
+  const res = await hsRequest(env, `/crm/v4/objects/contact/${contactId}/associations/company`, {
+    method: "GET"
+  });
 
   const results = Array.isArray(res?.results) ? res.results : [];
   if (!results.length) return null;
 
-  // Prefer Primary company (typeId === 1), else fall back to first
+  // If there's a "primary" association, prefer it. Otherwise choose the first company.
   const primary = results.find(r =>
     Array.isArray(r.associationTypes) &&
-    r.associationTypes.some(
-      t => t.category === "HUBSPOT_DEFINED" && t.typeId === 1
-    )
+    r.associationTypes.some(t => t.category === "HUBSPOT_DEFINED" && t.typeId === 1)
   );
 
   const picked = primary || results[0];
-  const companyId = picked && picked.toObjectId;
+  const companyId = picked?.toObjectId;
   return companyId ? String(companyId) : null;
 }
 
 async function hsAssociateTicketToCompany(env, ticketId, companyId) {
-  if (!env.HUBSPOT_TOKEN) {
-    throw new Error("HUBSPOT_TOKEN missing for associations");
-  }
-  if (!ticketId || !companyId) {
-    throw new Error("ticketId and companyId required for ticket<->company association");
-  }
+  if (!ticketId || !companyId) throw new Error("ticketId and companyId required");
 
   await hsRequest(
     env,
@@ -1152,127 +918,87 @@ async function hsAssociateTicketToCompany(env, ticketId, companyId) {
   );
 }
 
-// Cache the note<->ticket associationTypeId so we only look it up once per worker instance
+/* ------------------------------ Files API ------------------------------- */
+
+async function hsUploadFile(env, file) {
+  if (!env.HUBSPOT_TOKEN) throw new Error("HUBSPOT_TOKEN missing for Files API");
+
+  const fd = new FormData();
+  fd.append("file", file, file.name || "attachment");
+  fd.append("options", JSON.stringify({ access: "PRIVATE" }));
+
+  const folderPath = env.HS_FILES_FOLDER_PATH || "/warranty-intake";
+  fd.append("folderPath", folderPath);
+
+  // Files endpoint expects multipart/form-data; do NOT set Content-Type manually.
+  const resp = await fetch("https://api.hubapi.com/files/v3/files", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.HUBSPOT_TOKEN}` },
+    body: fd
+  });
+
+  const text = await resp.text().catch(() => "");
+  let data = {};
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = {};
+    }
+  }
+
+  if (!resp.ok) {
+    const msg = data?.message || text.slice(0, 300);
+    throw new Error(`HubSpot Files ${resp.status}: ${msg}`);
+  }
+
+  return data;
+}
+
+/* ------------------------------ Notes API ------------------------------- */
+
 let cachedNoteTicketAssociationTypeId = null;
 
 async function hsGetNoteTicketAssociationTypeId(env) {
-  if (cachedNoteTicketAssociationTypeId !== null) {
-    return cachedNoteTicketAssociationTypeId;
-  }
+  if (cachedNoteTicketAssociationTypeId !== null) return cachedNoteTicketAssociationTypeId;
 
-  if (!env.HUBSPOT_TOKEN) {
-    throw new Error("HUBSPOT_TOKEN missing for associations");
-  }
-
-  // Get association labels for notes <-> tickets
-  const res = await hsRequest(env, "/crm/v4/associations/notes/tickets/labels", {
-    method: "GET"
-  });
-
+  const res = await hsRequest(env, "/crm/v4/associations/notes/tickets/labels", { method: "GET" });
   const results = Array.isArray(res?.results) ? res.results : [];
-  if (!results.length) {
-    throw new Error("No association labels returned for notes<->tickets");
-  }
+  if (!results.length) throw new Error("No association labels returned for notes<->tickets");
 
-  // Prefer a HUBSPOT_DEFINED association (the default unlabeled association),
-  // otherwise just use the first available type.
-  const label =
-    results.find(r => r.category === "HUBSPOT_DEFINED") ||
-    results[0];
+  // Prefer HUBSPOT_DEFINED label when present
+  const label = results.find(r => r.category === "HUBSPOT_DEFINED") || results[0];
 
-  // HubSpot returns `typeId` as the numeric identifier for the association type.
   const typeId =
     (typeof label.typeId === "number" && label.typeId) ||
     (typeof label.associationTypeId === "number" && label.associationTypeId) ||
     null;
 
-  if (!typeId) {
-    console.error("Unexpected notes<->tickets label payload:", JSON.stringify(label));
-    throw new Error("No numeric typeId/associationTypeId found for notes<->tickets");
-  }
+  if (!typeId) throw new Error("No numeric typeId/associationTypeId found for notes<->tickets");
 
   cachedNoteTicketAssociationTypeId = typeId;
   return typeId;
 }
 
-// -------- Files API: upload a single file (multipart/form-data) --------
-async function hsUploadFile(env, file) {
-  if (!env.HUBSPOT_TOKEN) {
-    throw new Error("HUBSPOT_TOKEN missing for Files API");
-  }
-
-  const fd = new FormData();
-
-  // File field
-  fd.append("file", file, file.name || "attachment");
-
-  // Required options: at minimum, access level
-  fd.append(
-    "options",
-    JSON.stringify({
-      access: "PRIVATE" // so it’s usable as a CRM attachment, not a public asset
-    })
-  );
-
-  // Folder path is required by Files v3; use env override or default
-  const folderPath = env.HS_FILES_FOLDER_PATH || "/warranty-intake";
-  fd.append("folderPath", folderPath);
-
-  const resp = await fetch("https://api.hubapi.com/files/v3/files", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${env.HUBSPOT_TOKEN}`
-      // DO NOT set Content-Type; fetch will set proper multipart boundary
-    },
-    body: fd
-  });
-
-  const text = await resp.text().catch(() => "");
-  let json = {};
-  if (text) {
-    try {
-      json = JSON.parse(text);
-    } catch {
-      json = {};
-    }
-  }
-
-  if (!resp.ok) {
-    console.error("HubSpot Files upload failed", resp.status, text);
-    const msg = json?.message || text.slice(0, 300);
-    throw new Error(`HubSpot Files ${resp.status}: ${msg}`);
-  }
-
-  return json; // includes id, name, url, etc.
-}
-
-// -------- Notes API: create note with hs_attachment_ids on a ticket --------
 async function hsCreateNoteWithAttachments(env, ticketId, claimNumber, fileIds, vin) {
-  if (!env.HUBSPOT_TOKEN) throw new Error("HUBSPOT_TOKEN missing for Notes API");
-  if (!ticketId) throw new Error("ticketId required for note association");
-  if (!fileIds || !fileIds.length) throw new Error("fileIds required for hs_attachment_ids");
+  if (!ticketId) throw new Error("ticketId required");
+  if (!fileIds?.length) throw new Error("fileIds required");
 
   const nowIso = new Date().toISOString();
   const hs_attachment_ids = fileIds.join(";");
 
-  // Look up the numeric associationTypeId for note<->ticket
   const associationTypeId = await hsGetNoteTicketAssociationTypeId(env);
 
   const body = {
     properties: {
       hs_timestamp: nowIso,
-      hs_note_body: `Warranty attachments uploaded via intake form for Claim #${claimNumber} (VIN ${vin}).`,
+      hs_note_body: `Warranty attachments uploaded via dealer intake form for Claim #${claimNumber} (VIN ${vin}).`,
       hs_attachment_ids
     },
     associations: [
       {
         to: { id: ticketId },
-        types: [
-          {
-            associationCategory: "HUBSPOT_DEFINED",
-            associationTypeId
-          }
-        ]
+        types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId }]
       }
     ]
   };
@@ -1283,4 +1009,74 @@ async function hsCreateNoteWithAttachments(env, ticketId, claimNumber, fileIds, 
   });
 
   return res?.id || null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Small Utilities                                                              */
+/* -------------------------------------------------------------------------- */
+
+function toTrim(v) {
+  return String(v ?? "").trim();
+}
+
+function toLowerTrim(v) {
+  return toTrim(v).toLowerCase();
+}
+
+function toUpperTrim(v) {
+  return toTrim(v).toUpperCase();
+}
+
+function compactProps(obj) {
+  const out = {};
+  for (const [k, v] of Object.entries(obj || {})) {
+    if (v === undefined || v === null) continue;
+    if (typeof v === "string" && v.trim() === "") continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function escapeHtml(str = "") {
+  return String(str)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function looksLikeFile(value) {
+  // Cloudflare provides File objects, but we keep this runtime-safe.
+  return (
+    value &&
+    typeof value === "object" &&
+    typeof value.name === "string" &&
+    typeof value.size === "number" &&
+    typeof value.arrayBuffer === "function"
+  );
+}
+
+function isValidVin(vin) {
+  return /^[A-HJ-NPR-Z0-9]{17}$/.test(String(vin || "").toUpperCase());
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").toLowerCase());
+}
+
+function joinName(first, last) {
+  return [first, last].map(s => String(s || "").trim()).filter(Boolean).join(" ");
+}
+
+function joinAddress(parts) {
+  return (parts || []).map(p => String(p || "").trim()).filter(Boolean).join(", ");
+}
+
+function getTrailerNumberFromVin(vin) {
+  // Original logic: 10th char + last 4 (if VIN is 17)
+  if (typeof vin === "string" && vin.length === 17) {
+    return vin.charAt(9) + vin.slice(13);
+  }
+  return vin || "";
 }
