@@ -1,27 +1,57 @@
 <!--
   Boatmate — Dealer Warranty Intake Form (Dealer-only)
   ====================================================
+
+  STATUS
+  - Stable (Dealer form complete)
+
+  LAST UPDATED
+  - 2026-01-06
+
   PURPOSE
-  - Collects a dealer-submitted warranty claim for Boatmate trailers.
-  - Posts multipart/form-data to a Cloudflare Worker endpoint.
-  - Supports multiple file uploads (up to 10 files, 10MB each).
+  - Collect dealer-submitted warranty claims via a single HTML form.
+  - Submit claims as multipart/form-data to a Cloudflare Worker endpoint.
+  - Provide consistent, user-friendly, client-side validation + messaging.
 
-  IMPORTANT BUSINESS RULES (CURRENT)
-  - Dealer-only form: claim_submitted_by is always "dealer" (hidden field).
-  - Customer Information: FIRST/LAST name only (no customer address/phone/email).
-  - Ship To: REMOVED entirely. Do not collect, validate, or send to the backend.
-  - Labor rate: NOT part of this project. Do not collect or send.
+  HARD BUSINESS RULES (DO NOT DRIFT)
+  - Dealer-only submission: hidden field `claim_submitted_by=dealer` is always sent.
+  - Customer Information is name-only and conditional:
+      • Hidden by default
+      • Shown ONLY when “Is this a sold unit?” = Yes
+      • Customer First/Last become REQUIRED only when shown
+      • Customer inputs are DISABLED when hidden to prevent accidental submission
+  - “Ship To” is removed entirely:
+      • Do not collect, validate, submit, store, or map it anywhere
+  - Labor rate is NOT part of this project:
+      • Do not collect or submit labor rate
 
-  INTEGRATION ASSUMPTIONS
-  - The Worker returns JSON: { ok: true, claimNumber: <number>, ... } on success
-  - On failure it returns JSON: { ok: false, errors: [...] } (or message)
+  VALIDATION DESIGN
+  - The form uses `novalidate` so browser-native validation UI is bypassed.
+  - Validation is enforced in JavaScript in top-to-bottom form order:
+      1) Dealer Information required fields
+      2) “Is this a sold unit?” required selection (fieldset highlighted when missing)
+      3) Customer name fields required ONLY when sold-unit = Yes
+      4) Warranty Claim fields required (VIN validated first; format = 17 chars, no I/O/Q)
+      5) Attachments required and constrained (max 10 files; max 10MB each)
+  - Error messages are user-friendly:
+      • Prefer curated `FIELD_LABELS` over raw IDs
+      • Fallback to DOM <label for="..."> text
+      • Final fallback is raw id (never fails silently)
+
+  SUBMISSION / INTEGRATION
+  - Posts to a Cloudflare Worker endpoint (WARRANTY_ENDPOINT).
+  - Expected Worker response:
+      • Success: { ok: true, claimNumber: <number>, ... }
+      • Error:   { ok: false, errors: [...] } or { message: "..." }
+  - On success:
+      • Shows a success status message including the claim number
+      • Resets the form
+      • Restores hidden fields + initial UI state (Customer section hidden)
 
   MAINTENANCE NOTES
-  - Keep input `name` attributes aligned with the Worker’s form-data parsing.
-  - Keep IDs aligned with the front-end validation list.
-  - Honeypot field name is "website" (hidden). The Worker should accept it.
-
-  FILE: dealer-warranty-intake.html
+  - Keep input `id` + `name` aligned with Worker parsing.
+  - Update validation arrays and FIELD_LABELS when adding/removing fields.
+  - Keep attachment constraints aligned with backend enforcement.
 -->
 
 <!doctype html>
@@ -81,6 +111,13 @@
         margin: 0 0 14px;
       }
 
+      /* Make an entire fieldset show invalid (useful for radio groups) */
+      fieldset.bm-invalid {
+        outline: 2px solid var(--bm-error);
+        outline-offset: 2px;
+        border-color: var(--bm-error);
+      }
+
       legend {
         font-weight: 700;
         padding: 0 8px;
@@ -127,6 +164,34 @@
         font-size: 12px;
       }
 
+      /* Utility: hide a section completely (used for conditional customer section) */
+      .is-hidden {
+        display: none;
+      }
+
+      /* -----------------------------------------------------------------------
+        Radio group styling (horizontal options)
+      ------------------------------------------------------------------------ */
+      .radio-group {
+        display: flex;
+        gap: 1.5rem; /* even horizontal spacing between options */
+        margin-top: 0.25rem;
+        align-items: center;
+        flex-wrap: wrap; /* prevents ugly overflow on small screens */
+      }
+
+      .radio-option {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        font-size: 0.95rem;
+        white-space: nowrap; /* keeps option text on one line */
+      }
+
+      .radio-option input[type="radio"] {
+        margin: 0; /* avoids default browser offset */
+      }
+
       /* -----------------------------------------------------------------------
         Layout Grids
         - field-grid--two: shared 2-col layout for Dealer + Customer sections
@@ -166,6 +231,7 @@
       /* -----------------------------------------------------------------------
         Validation + Status
       ------------------------------------------------------------------------ */
+      /* Applied to individual invalid inputs */
       .bm-invalid {
         outline: 2px solid var(--bm-error);
         outline-offset: 1px;
@@ -246,12 +312,13 @@
 
   <body>
     <div class="wrapper">
+      <!-- novalidate: we intentionally handle validation ourselves in JS -->
       <form id="warranty-form" novalidate>
-        <!-- Dealer-only: hard-coded submitter -->
+        <!-- Dealer-only: hard-coded submitter and category for the Worker -->
         <input id="claim_submitted_by" type="hidden" name="claim_submitted_by" value="dealer" />
         <input id="category" type="hidden" name="category" value="Warranty" />
 
-        <!-- Honeypot: bots fill this; humans never see it -->
+        <!-- Honeypot: bots fill this; humans never see it. Worker should treat this as spam. -->
         <div class="hp" aria-hidden="true">
           <label for="website">Website</label>
           <input id="website" name="website" type="text" tabindex="-1" autocomplete="off" />
@@ -314,19 +381,36 @@
           </div>
         </fieldset>
 
-        <!-- Customer Information (Name Only) -->
-        <fieldset>
+        <!-- Is this a sold unit? (controls whether Customer Information is displayed/required) -->
+        <fieldset id="sold-unit-fieldset">
+          <legend>Is this a sold unit?</legend>
+
+          <div class="radio-group" role="radiogroup" aria-label="Is this a sold unit?">
+            <label class="radio-option" for="is_sold_unit_yes">
+              <input id="is_sold_unit_yes" name="is_sold_unit" type="radio" value="yes" required />
+              Yes
+            </label>
+
+            <label class="radio-option" for="is_sold_unit_no">
+              <input id="is_sold_unit_no" name="is_sold_unit" type="radio" value="no" required />
+              No
+            </label>
+          </div>
+        </fieldset>
+
+        <!-- Customer Information (conditionally shown + conditionally required) -->
+        <fieldset id="customer-info-fieldset" class="is-hidden">
           <legend>Customer Information</legend>
 
           <div class="field-grid field-grid--two">
             <div class="field">
               <label for="customer_first_name">First Name</label>
-              <input id="customer_first_name" name="customer_first_name" type="text" required />
+              <input id="customer_first_name" name="customer_first_name" type="text" />
             </div>
 
             <div class="field">
               <label for="customer_last_name">Last Name</label>
-              <input id="customer_last_name" name="customer_last_name" type="text" required />
+              <input id="customer_last_name" name="customer_last_name" type="text" />
             </div>
           </div>
         </fieldset>
@@ -370,12 +454,12 @@
             <!-- Row 3 -->
             <div class="field">
               <label for="labor_hours">Warranty Labor Hours</label>
-              <input id="labor_hours" name="labor_hours" type="text" inputmode="decimal" />
+              <input id="labor_hours" name="labor_hours" type="text" inputmode="decimal" required />
             </div>
 
             <div class="field">
               <label for="attachments">File Upload</label>
-              <input id="attachments" name="attachments" type="file" multiple />
+              <input id="attachments" name="attachments" type="file" multiple required />
               <small>Up to 10 files. Max 10MB each.</small>
             </div>
           </div>
@@ -388,6 +472,7 @@
             <span class="bm-spinner" aria-hidden="true"></span>
           </button>
 
+          <!-- Screen-reader friendly: updates with success/error messages -->
           <span id="form-status" aria-live="polite"></span>
         </div>
       </form>
@@ -396,99 +481,279 @@
     <script>
       /**
        * Dealer Warranty Intake — Front-end Script
-       * ----------------------------------------
-       * Responsibilities:
-       * - Client-side validation (required fields, VIN format, file limits)
-       * - Submit multipart/form-data to the Worker endpoint
-       * - Display success/error status + claim number
-       * - Prevent double submits; show loading state
+       * ========================================
        *
-       * NOTE: The backend remains the source of truth for validation.
+       * RESPONSIBILITIES
+       * - Keep the sold-unit toggle UX consistent:
+       *    • Customer section hidden by default
+       *    • Customer fields required ONLY when sold-unit = yes
+       * - Client-side validation (required fields, VIN format, attachment rules)
+       * - Submit multipart/form-data to the Cloudflare Worker endpoint
+       * - Display success/error status + claim number
+       * - Prevent double-submits and show a loading/spinner state
+       *
+       * WHY CUSTOM VALIDATION?
+       * - The form uses `novalidate`, so browser-native required handling is bypassed.
+       * - We enforce required rules manually to keep UI + messaging consistent.
+       *
+       * NOTE
+       * - Backend validation is still the final source of truth.
        */
       (() => {
         // ---------------------------------------------------------------------
         // Config
         // ---------------------------------------------------------------------
-        const WARRANTY_ENDPOINT = 'https://warranty-intake-form.boatmate-trailers-llc.workers.dev/';
+        // Worker endpoint that receives the form submission
+        const WARRANTY_ENDPOINT = "https://warranty-intake-form.boatmate-trailers-llc.workers.dev/";
 
-        // File limits should match (or be <=) backend enforcement.
+        // File limits must match (or be stricter than) backend enforcement
         const MAX_FILES = 10;
-        const MAX_FILE_BYTES = 10 * 1024 * 1024; // 10MB
+        const MAX_FILE_BYTES = 10 * 1024 * 1024; // 10MB per file
 
         // ---------------------------------------------------------------------
         // DOM References
         // ---------------------------------------------------------------------
-        const form = document.getElementById('warranty-form');
-        const statusEl = document.getElementById('form-status');
-        const submitBtn = document.getElementById('submit-btn');
-        const btnLabel = submitBtn?.querySelector('.btn-label');
+        const form = document.getElementById("warranty-form");
+        const statusEl = document.getElementById("form-status");
+        const submitBtn = document.getElementById("submit-btn");
+        const btnLabel = submitBtn?.querySelector(".btn-label");
 
-        // IDs that must exist and be non-empty for a valid dealer submission.
-        const REQUIRED_IDS = [
-          // Dealer
-          'dealer_name',
-          'dealer_first_name',
-          'dealer_last_name',
-          'dealer_address',
-          'dealer_city',
-          'dealer_region',
-          'dealer_postal_code',
-          'dealer_country',
-          'dealer_phone',
-          'dealer_email',
+        // IDs that must be non-empty for a valid dealer submission (always required)
+        const DEALER_REQUIRED_IDS = [
+          "dealer_name",
+          "dealer_first_name",
+          "dealer_last_name",
+          "dealer_address",
+          "dealer_city",
+          "dealer_region",
+          "dealer_postal_code",
+          "dealer_country",
+          "dealer_phone",
+          "dealer_email"
+        ];
 
-          // Customer (name only)
-          'customer_first_name',
-          'customer_last_name',
+        // IDs that are required ONLY when sold-unit = yes
+        const CONDITIONAL_CUSTOMER_IDS = [
+          "customer_first_name", 
+          "customer_last_name"
+        ];
 
-          // Claim
-          'vin',
-          'date_of_occurrence',
-          'warranty_symptoms',
-          'warranty_request'
+        const CLAIM_REQUIRED_IDS = [
+          "vin",
+          "date_of_occurrence",
+          "warranty_symptoms",
+          "warranty_request",
+          "labor_hours",
         ];
 
         // ---------------------------------------------------------------------
-        // Small Helpers
+        // Friendly error messages (labels > ids)
+        // ---------------------------------------------------------------------
+        //
+        // Strategy:
+        // 1) Prefer a curated label map (stable + controlled wording)
+        // 2) Fall back to the DOM <label for="..."> text if present
+        // 3) Final fallback: the raw id (so we never fail silently)
+        //
+        // Use `labelFor(id)` whenever generating user-facing error messages.
+
+        const FIELD_LABELS = {
+          // Dealer Information
+          dealer_name: "Dealership",
+          dealer_first_name: "Dealer First Name",
+          dealer_last_name: "Dealer Last Name",
+          dealer_address: "Address",
+          dealer_city: "City",
+          dealer_region: "State/Province/Region",
+          dealer_postal_code: "Zip/Postal Code",
+          dealer_country: "Country/Region",
+          dealer_phone: "Phone",
+          dealer_email: "Email",
+
+          // Customer Information (conditional)
+          customer_first_name: "Customer First Name",
+          customer_last_name: "Customer Last Name",
+
+          // Warranty Claim Information
+          vin: "Trailer VIN",
+          date_of_occurrence: "Date of Occurrence",
+          warranty_symptoms: "Warranty Symptoms",
+          warranty_request: "Warranty Request",
+          labor_hours: "Warranty Labor Hours",
+
+          // Attachments
+          attachments: "File Upload",
+        };
+
+        /**
+        * Return the best-available user-friendly label for a given field id.
+        */
+        function labelFor(id) {
+          if (FIELD_LABELS[id]) return FIELD_LABELS[id];
+
+          // DOM fallback: <label for="id">Some Text</label>
+          const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+          const text = lbl ? String(lbl.textContent || "").trim() : "";
+          if (text) return text;
+
+          return id; // ultimate fallback
+        }
+
+        /**
+        * Optional: Standardize your “required” messages in one place.
+        * You can add special cases here later without touching validation loops.
+        */
+        function requiredMsg(id) {
+          return `${labelFor(id)} is required.`;
+        }
+
+        /**
+        * Optional: Standardize format messages.
+        */
+        function invalidEmailMsg() {
+          return "Email must be a valid email address.";
+        }
+
+        function invalidVinMsg() {
+          return "Trailer VIN must be 17 characters (no I, O, Q).";
+        }
+
+        // ---------------------------------------------------------------------
+        // Sold-unit toggle + Customer section control
+        // ---------------------------------------------------------------------
+        const SOLD_UNIT_NAME = "is_sold_unit"; // radio input name
+        const customerFieldset = document.getElementById("customer-info-fieldset");
+        const customerFirst = document.getElementById("customer_first_name");
+        const customerLast = document.getElementById("customer_last_name");
+        const soldUnitFieldset = document.getElementById("sold-unit-fieldset");
+
+        /**
+         * Returns the selected sold-unit value ("yes" | "no" | "").
+         * Empty string means the user hasn't chosen an option yet.
+         */
+        function getSoldUnitValue() {
+          return form.querySelector(`input[name="${SOLD_UNIT_NAME}"]:checked`)?.value || "";
+        }
+
+        /**
+         * Shows/hides the Customer Information section and synchronizes the inputs:
+         * - When visible: inputs enabled + required
+         * - When hidden:  inputs disabled + not required + invalid styles cleared
+         *
+         * Disabling inputs when hidden prevents accidental submission of stale values.
+         */
+        function setCustomerSectionVisible(visible) {
+          if (!customerFieldset) return;
+
+          customerFieldset.classList.toggle("is-hidden", !visible);
+
+          [customerFirst, customerLast].forEach((el) => {
+            if (!el) return;
+
+            el.disabled = !visible;
+            el.required = visible; // HTML-level required (we still enforce in JS due to novalidate)
+            if (!visible) el.classList.remove("bm-invalid");
+          });
+        }
+
+        // Initial state: customer section hidden + fields disabled
+        setCustomerSectionVisible(false);
+
+        /**
+         * Whenever the sold-unit radio changes:
+         * - remove any sold-unit "fieldset invalid" styling
+         * - show/hide customer section immediately
+         */
+        form.addEventListener("change", (e) => {
+          if (e.target && e.target.name === SOLD_UNIT_NAME) {
+            clearSoldUnitInvalid();
+            setCustomerSectionVisible(getSoldUnitValue() === "yes");
+          }
+        });
+
+        /**
+         * Fieldset-level invalid styling for the sold-unit radio group.
+         * This is clearer than trying to outline individual radios.
+         */
+        function markSoldUnitInvalid() {
+          soldUnitFieldset?.classList.add("bm-invalid");
+        }
+
+        function clearSoldUnitInvalid() {
+          soldUnitFieldset?.classList.remove("bm-invalid");
+        }
+
+        // ---------------------------------------------------------------------
+        // UI helpers
         // ---------------------------------------------------------------------
         function setStatus(message, ok = true) {
           if (!statusEl) return;
-          statusEl.textContent = message || '';
-          statusEl.className = ok ? 'success' : 'error';
+          statusEl.textContent = message || "";
+          statusEl.className = ok ? "success" : "error";
         }
 
+        /**
+         * Sets the submit button loading state.
+         * Important: we never overwrite submitBtn.textContent, because that would remove the spinner span.
+         */
         function setSubmitting(isSubmitting) {
           if (!submitBtn) return;
 
           submitBtn.disabled = isSubmitting;
-          submitBtn.classList.toggle('is-loading', isSubmitting);
-          form.setAttribute('aria-busy', isSubmitting ? 'true' : 'false');
+          submitBtn.classList.toggle("is-loading", isSubmitting);
+          form.setAttribute("aria-busy", isSubmitting ? "true" : "false");
 
-          // IMPORTANT: Don’t use submitBtn.textContent here (it would remove the spinner span).
           if (btnLabel) {
-            btnLabel.textContent = isSubmitting ? 'Submitting…' : 'Submit Warranty Claim';
+            btnLabel.textContent = isSubmitting ? "Submitting…" : "Submit Warranty Claim";
           }
         }
 
         function markInvalid(id) {
           const el = document.getElementById(id);
-          if (el) el.classList.add('bm-invalid');
+          if (el) el.classList.add("bm-invalid");
         }
 
+        /**
+         * Clears invalid UI styling for:
+         * - always-required IDs
+         * - conditional customer IDs
+         * - sold-unit fieldset
+         *
+         * NOTE: The spread operator (...) flattens both arrays into one list of IDs.
+         */
         function clearInvalid() {
-          REQUIRED_IDS.forEach((id) => {
+          [...DEALER_REQUIRED_IDS, ...CONDITIONAL_CUSTOMER_IDS, ...CLAIM_REQUIRED_IDS].forEach((id) => {
             const el = document.getElementById(id);
-            if (el) el.classList.remove('bm-invalid');
+            if (el) el.classList.remove("bm-invalid");
           });
+
+          clearSoldUnitInvalid();
         }
 
-        // VIN format check only (no checksum)
+        // Email format check
+        function isValidEmail(email) {
+          return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim().toLowerCase());
+        }
+
+        // VIN format check only (regex; no checksum)
         function isValidVin(vin) {
-          return /^[A-HJ-NPR-Z0-9]{17}$/.test(String(vin || '').trim().toUpperCase());
+          return /^[A-HJ-NPR-Z0-9]{17}$/.test(String(vin || "").trim().toUpperCase());
         }
 
+        /**
+         * Enforces attachment rules:
+         * - at least one file required
+         * - max count
+         * - max per-file size
+         *
+         * Returns an error string when invalid, otherwise null.
+         */
         function validateFiles(fileInput) {
           const files = fileInput?.files ? Array.from(fileInput.files) : [];
+
+          if (files.length === 0) {
+            return "At least one attachment is required.";
+          }
 
           if (files.length > MAX_FILES) {
             return `Too many attachments. Maximum is ${MAX_FILES} files per submission.`;
@@ -503,20 +768,24 @@
           return null;
         }
 
-        // Lightweight per-field UX: remove red outline once the user edits/fixes a field.
+        /**
+         * Lightweight per-field UX:
+         * When a user starts typing into an invalid field, remove the red outline.
+         * We wire this for both always-required and conditional customer fields.
+         */
         function wireFieldValidation() {
-          REQUIRED_IDS.forEach((id) => {
+          [...DEALER_REQUIRED_IDS, ...CONDITIONAL_CUSTOMER_IDS, ...CLAIM_REQUIRED_IDS].forEach((id) => {
             const el = document.getElementById(id);
             if (!el) return;
 
             const handler = () => {
-              const val = String(el.value || '').trim();
-              if (val) el.classList.remove('bm-invalid');
+              const val = String(el.value || "").trim();
+              if (val) el.classList.remove("bm-invalid");
             };
 
-            el.addEventListener('input', handler);
-            el.addEventListener('change', handler);
-            el.addEventListener('blur', handler);
+            el.addEventListener("input", handler);
+            el.addEventListener("change", handler);
+            el.addEventListener("blur", handler);
           });
         }
 
@@ -525,74 +794,152 @@
         // ---------------------------------------------------------------------
         async function handleSubmit(e) {
           e.preventDefault();
-          setStatus('');
+
+          // Reset UI status + invalid highlighting on each attempt
+          setStatus("");
           clearInvalid();
 
-          // Normalize VIN to uppercase before validation + submission
-          const vinEl = document.getElementById('vin');
-          if (vinEl) vinEl.value = String(vinEl.value || '').trim().toUpperCase();
+          // Normalize VIN to uppercase before validation and submission
+          const vinEl = document.getElementById("vin");
+          if (vinEl) vinEl.value = String(vinEl.value || "").trim().toUpperCase();
 
           const errors = [];
 
-          // Required field validation
-          for (const id of REQUIRED_IDS) {
+          // ------------------------------
+          // 1) Dealer Information (top)
+          // ------------------------------
+          for (const id of DEALER_REQUIRED_IDS) {
             const el = document.getElementById(id);
-            const val = el ? String(el.value || '').trim() : '';
+            const val = el ? String(el.value || "").trim() : "";
 
             if (!val) {
-              errors.push(`${id} is required.`);
+              errors.push(requiredMsg(id));
+              markInvalid(id);
+              continue;
+            }
+
+            if (id === "dealer_email" && !isValidEmail(val)) {
+              errors.push(invalidEmailMsg());
+              markInvalid("dealer_email");
+            }
+          }
+
+          // ------------------------------
+          // 2) Sold Unit (middle)
+          // ------------------------------
+          const soldUnit = getSoldUnitValue();
+
+          // Keep UI state synced
+          setCustomerSectionVisible(soldUnit === "yes");
+
+          if (!soldUnit) {
+            errors.push('Please select "Yes" or "No" for "Is this a sold unit?"');
+            markSoldUnitInvalid();
+          } else {
+            clearSoldUnitInvalid();
+          }
+
+          // ------------------------------
+          // 3) Customer Information (only if sold-unit = yes)
+          // ------------------------------
+          if (soldUnit === "yes") {
+            for (const id of CONDITIONAL_CUSTOMER_IDS) {
+              const el = document.getElementById(id);
+
+              // Safety: if hidden/disabled, do not validate
+              if (!el || el.disabled) continue;
+
+              const val = String(el.value || "").trim();
+              if (!val) {
+                errors.push(requiredMsg(id)); // or `${labelFor(id)} is required.`
+                markInvalid(id);
+              }
+            }
+          }
+
+          // ------------------------------
+          // 4) Warranty Claim Information (bottom)
+          // ------------------------------
+          // VIN format validation should appear before the other claim-field errors
+          if (vinEl) {
+            const vinVal = String(vinEl.value || "").trim(); // already uppercased above
+
+            if (!vinVal) {
+              errors.push(requiredMsg("vin"));
+              markInvalid("vin");
+            } else if (!isValidVin(vinVal)) {
+              errors.push(invalidVinMsg());
+              markInvalid("vin");
+            }
+          }
+
+          // Validate remaining claim fields in visual order (skip VIN since we handled it)
+          for (const id of CLAIM_REQUIRED_IDS) {
+            if (id === "vin") continue;
+
+            const el = document.getElementById(id);
+            const val = el ? String(el.value || "").trim() : "";
+
+            if (!val) {
+              errors.push(requiredMsg(id));
               markInvalid(id);
             }
           }
 
-          // VIN format validation
-          if (vinEl && vinEl.value && !isValidVin(vinEl.value)) {
-            errors.push('VIN must be 17 characters (no I, O, Q).');
-            markInvalid('vin');
-          }
-
-          // Attachment validation
-          const fileInput = document.getElementById('attachments');
+          // ------------------------------
+          // 5) Attachments (last)
+          // ------------------------------
+          const fileInput = document.getElementById("attachments");
           const fileErr = validateFiles(fileInput);
           if (fileErr) errors.push(fileErr);
 
+          // Show the first error only (now ordered top-to-bottom)
           if (errors.length) {
-            // Only show the first error to keep UX clean
             setStatus(errors[0], false);
             return;
           }
 
-          // Build the multipart/form-data payload from the form
+          // ---------------------------------------------------------------
+          // Submit to Worker
+          // ---------------------------------------------------------------
           const formData = new FormData(form);
-
           setSubmitting(true);
 
           try {
-            const resp = await fetch(WARRANTY_ENDPOINT, { method: 'POST', body: formData });
+            const resp = await fetch(WARRANTY_ENDPOINT, { method: "POST", body: formData });
 
-            // Worker should return JSON; fall back safely if it doesn’t.
+            // Expect JSON but fail safely if the response isn't JSON
             const data = await resp.json().catch(() => null);
 
+            // Non-OK HTTP or unexpected payload format => treat as an error
             if (!resp.ok || !data || data.ok !== true) {
               const msg =
-                (data && (data.message || (Array.isArray(data.errors) ? data.errors.join(' ') : ''))) ||
+                (data && (data.message || (Array.isArray(data.errors) ? data.errors.join(" ") : ""))) ||
                 `Submission failed (HTTP ${resp.status}).`;
               setStatus(msg, false);
               return;
             }
 
-            setStatus(`Submitted successfully. Claim #${data.claimNumber}.`, true);
+            // Success!
+            setStatus(`Claim #${data.claimNumber} submitted successfully.`, true);
 
-            // Reset form for the next submission
+            // -----------------------------------------------------------
+            // Reset UI for next submission
+            // -----------------------------------------------------------
             form.reset();
 
-            // Re-apply fixed hidden values after reset
+            // Return conditional sections to initial state
+            setCustomerSectionVisible(false);
+            clearSoldUnitInvalid();
+
+            // Reset hidden fixed values after reset()
             const submitter = form.querySelector('input[name="claim_submitted_by"]');
             const category = form.querySelector('input[name="category"]');
-            if (submitter) submitter.value = 'dealer';
-            if (category) category.value = 'Warranty';
+            if (submitter) submitter.value = "dealer";
+            if (category) category.value = "Warranty";
           } catch (err) {
-            setStatus('Network error while submitting. Please try again.', false);
+            // Network-level failure (offline, DNS, CORS misconfig, etc.)
+            setStatus("Network error while submitting. Please try again.", false);
           } finally {
             setSubmitting(false);
           }
@@ -601,8 +948,11 @@
         // ---------------------------------------------------------------------
         // Boot
         // ---------------------------------------------------------------------
+        // 1) Wire "remove red outline when user fixes field"
         wireFieldValidation();
-        form.addEventListener('submit', handleSubmit);
+
+        // 2) Handle submit (custom validation + fetch)
+        form.addEventListener("submit", handleSubmit);
       })();
     </script>
   </body>
