@@ -1,21 +1,33 @@
-// warranty-form-handler.js
-/**
+/* ================================================================
  * Boatmate — Warranty Intake (Dealer Form Only) — Cloudflare Worker
  * ================================================================
+ *
+ * VERSION
+ * - v1.1.0
  *
  * STATUS
  * - Stable (Dealer form live / hard changeover)
  *
  * LAST UPDATED
- * - 2026-01-06
+ * - 2026-03-11
  *
  * PURPOSE
  * - Receive dealer-submitted warranty claims from the Dealer Warranty Intake HTML form.
- * - Validate inputs + attachments.
- * - Generate a sequential Claim # (Durable Object).
- * - Create/Upsert HubSpot CRM records (Contact + Ticket).
- * - Upload attachments to HubSpot Files (PRIVATE) + attach via a Note.
- * - Optionally send a confirmation email via Brevo.
+ * - Accept and parse multipart/form-data submissions (primary) and application/json (supported).
+ * - Enforce dealer-only submission rules, sold-unit conditional requirements, and attachment requirements.
+ * - Generate a sequential Claim # using a Durable Object counter.
+ * - Create or locate the submitting dealer Contact in HubSpot by email.
+ * - Create a Warranty Ticket in HubSpot and associate it to the Contact and primary Company when available.
+ * - Upload submitted attachments to HubSpot Files (PRIVATE) and attach them to the Ticket via a Note.
+ * - Optionally send a confirmation email when email delivery is enabled in the environment.
+ * - Return JSON responses suitable for front-end form handling.
+ *
+ * INTEGRATION / ENVIRONMENT NOTES
+ * - CORS is enforced via an explicit allowlist for approved local, staging, and production origins.
+ * - OPTIONS preflight requests are handled for browser-based cross-origin form submission.
+ * - HubSpot operations require HUBSPOT_TOKEN and related pipeline/stage configuration.
+ * - Claim numbering requires the CLAIM_COUNTER Durable Object binding.
+ * - Confirmation email is optional and only runs when email environment variables are configured and enabled.
  *
  * HARD BUSINESS RULES (DO NOT DRIFT)
  * - Dealer-only submissions:
@@ -41,11 +53,26 @@
  *
  * RESPONSE CONTRACT (JSON)
  * - Success: { ok:true, claimNumber, ... }
- * - Error:   { ok:false, errors:[...], ... } (HTTP 400 for validation)
+ * - Validation Error: { ok:false, errors:[...], ... } with HTTP 400
+ * - Server/Error paths may return HTTP 500-class or other non-200 responses with JSON where applicable
+ *
+ * CHANGE LOG
+ * - v1.1.0 (2026-03-11)
+ *    • Added formal header versioning and change-log metadata
+ *    • Updated header summary to reflect current dealer-only live Worker behavior
+ *    • Documented CORS allowlist / preflight intent for local, staging, and production origins
+ *    • Clarified HubSpot flow: Contact upsert, Ticket creation, associations, attachment upload, and Note creation
+ *    • Clarified optional confirmation-email behavior via environment configuration
+ * - v1.0.0 (2026-01-06)
+ *    • Stable dealer-form Worker baseline documented for hard changeover
  */
 
 const ALLOWED_ORIGINS = new Set([
   "http://127.0.0.1:5500",
+  "https://staging.boatmateparts.com",
+  "https://www.staging.boatmateparts.com",
+  "http://staging.boatmateparts.com",
+  "http://www.staging.boatmateparts.com",
   "https://boatmateparts.com",
   "https://www.boatmateparts.com",
   "http://boatmateparts.com",

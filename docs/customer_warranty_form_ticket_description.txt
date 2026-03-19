@@ -1,0 +1,25 @@
+Warranty intake via website customer form.
+
+Claim #: <claimNumber>
+VIN: <vin>
+
+=== Customer Information ===
+Name: <customer_first_name> <customer_last_name>
+Email: <customer_email>
+Phone: <customer_phone>
+Address: <customer_address>, <customer_city>, <customer_region>, <customer_postal_code>, <customer_country>
+Original Owner?: <original_owner display value>
+Warranty Registration Complete?: <warranty_registration_complete display value>
+
+=== Original Selling Dealer ===
+Dealership: <dealer_name>
+Email: <dealer_email>
+Phone: <dealer_phone>
+Address: <dealer_address>, <dealer_city>, <dealer_region>, <dealer_postal_code>, <dealer_country>
+
+=== Warranty Claim Information ===
+Date of Occurrence: <date_of_occurrence>
+Warranty Symptoms:
+<warranty_symptoms>
+Warranty Request:
+<warranty_request>
